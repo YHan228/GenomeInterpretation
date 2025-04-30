@@ -85,7 +85,7 @@ simulate_hmm_sequences <- function(order_name, estimate) {
                                    transitionMatrix = estimate$transprob_mat)
   
   # Simulate state transitions using markovchain
-  avg_len <- ceiling(estimate$avg_sequence_length / 10e5) * 10e5 / 2 * 5
+  avg_len <- ceiling(estimate$avg_sequence_length / 10e5) * 10e5 / 2 * 20
   
   simulated_sequence <- simHMM(hmm_model, length = avg_len)
   

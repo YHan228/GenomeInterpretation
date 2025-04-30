@@ -14,28 +14,30 @@ print(physical_gpus)
 
 set.seed(42)
 
-filters <- c(32, 64, 64, 128, 256)
-kernels <- c(12, 16, 24, 24, 32)
-pools <- c(2, 2, 2, 4, 4)
+filters <- c(32, 32, 64, 64, 128, 128, 256)
+kernels <- c(8, 16, 16, 24, 24, 32, 64)
+pools <- c(2, 2, 2, 2, 4, 4, 4)
 
 model <- create_model_lstm_cnn(
   maxlen = 1000000,
   layer_lstm = NULL,
-  layer_dense = c(128, 32, 2),
-  dropout_dense = c(0.3, 0.3, 0.3),
-  learning_rate = 0.00001,
+  layer_dense = c(128, 64, 32, 2),
+  gap = TRUE,
+  dropout_dense = NULL,
+  learning_rate = 0.0001,
   filters = filters,
   kernel_size = kernels,
   pool_size = pools)
 
-target_from_csv <- "synthetic/file_labels_new.csv"
+target_from_csv <- "synthetic/file_labels.csv"
 target_df <- read.csv(target_from_csv)
 label_names <- names(target_df)[names(target_df) != "file"]
 head(target_df)
 print(label_names)
-train_path <- "synthetic/new_data/train"
-val_path <- "synthetic/new_data/validation"
+train_path <- "synthetic/data/train"
+val_path <- "synthetic/data/validation"
 check_path <- "synthetic/checkpoints"
+# tb_path <- "synthetic/checkpoints/tensorboard_gap"
 
 hist <- train_model(
   train_type = "label_csv",
@@ -44,18 +46,20 @@ hist <- train_model(
   path = train_path,
   path_val = val_path,
   path_checkpoint = check_path,
+ # path_tensorboard = tb_path,
+ # tb_images = FALSE,
   train_val_ratio = 0.5,
-  run_name = "synthetic_new_1",
-  batch_size = 48,
+  run_name = "synthetic_gap",
+  batch_size = 16,
   epochs = 100,
   steps_per_epoch = 100,
   format = "fasta",
   concat_seq = "",
   vocabulary_label = label_names,
   lr_plateau_factor = 0.8,
-  patience = 10,
-  path_tensorboard = "synthetic/checkpoints/tensorboard"
-  )
+  patience = 5,
+  save_best_only = list(monitor = "val_acc")
+)
 
 plot_path <- file.path(check_path, "plot")
 if (!dir.exists(plot_path)) { 
