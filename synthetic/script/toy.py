@@ -6,42 +6,54 @@ CNN training + Integrated Gradients attribution quality
 Author: <your-name>, 2025-06-29
 """
 
-import random, string, math, os, itertools
+import itertools
+import math
+import os
+import random
+import string
 from typing import List, Tuple
 
-import numpy as np
-import torch, torch.nn as nn, torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, random_split
-from captum.attr import IntegratedGradients
 import matplotlib.pyplot as plt
-import torchattacks
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from captum.attr import IntegratedGradients, LayerGradCam
+from torch.utils.data import DataLoader, Dataset, random_split
 
-def set_seeds(seed_value=42):
+
+# --------------------------------------------------------------------------- //
+# 1. Configuration & Utilities
+# --------------------------------------------------------------------------- #
+
+WITH_CONFOUNDER = True # Global switch for GC-content difference
+
+def set_seeds(seed_value: int = 42) -> None:
     np.random.seed(seed_value)
     random.seed(seed_value)
     torch.manual_seed(seed_value)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed_value)
-    # The two lines below are not strictly necessary but ensure full determinism
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
-# set initial seed
-set_seeds()
 
-# ---------- 1. sequence utilities ------------------------------------------------
+set_seeds()  # initial seed
 
 ALPH = np.array(list("ACGT"), dtype="U1")
 to_ix = {b: i for i, b in enumerate(ALPH)}
+
 
 def sample_background(length: int, gc: float) -> np.ndarray:
     """iid sampling with given GC content, returns char array"""
     p = np.array([(1 - gc) / 2, gc / 2, gc / 2, (1 - gc) / 2])  # A,C,G,T
     return np.random.choice(ALPH, size=length, p=p)
 
+
 def random_chunk(length: int) -> np.ndarray:
-    """ 60-bp random chunk with balanced GC ≈50 % """
-    return sample_background(length, 0.5)
+    """60-bp random chunk with balanced GC ≈ 50 %"""
+    return sample_background(length, 0.50)
+
 
 def mutate(chunk: np.ndarray, conservation: float) -> np.ndarray:
     """Return a new chunk with given conservation level (≈ %identity)"""
@@ -53,6 +65,7 @@ def mutate(chunk: np.ndarray, conservation: float) -> np.ndarray:
         mutated_chunk[pos] = np.random.choice(np.setdiff1d(ALPH, [original_base]))
     return mutated_chunk
 
+
 def embed(seq: np.ndarray, chunk: np.ndarray) -> Tuple[np.ndarray, int]:
     """Insert chunk at random non-overlapping position; return new seq and start idx"""
     L, l = len(seq), len(chunk)
@@ -60,28 +73,36 @@ def embed(seq: np.ndarray, chunk: np.ndarray) -> Tuple[np.ndarray, int]:
     seq[start:start + l] = chunk
     return seq, start
 
+
 def one_hot(seq: np.ndarray) -> np.ndarray:
-    """(1000,) char -> (4,1000) float32 one-hot"""
+    """(1000,) char → (4,1000) float32 one-hot"""
     arr = np.zeros((4, len(seq)), dtype=np.float32)
     for i, b in enumerate(seq):
         arr[to_ix[b], i] = 1.0
     return arr
 
-# ---------- 2. dataset generation ------------------------------------------------
+
+# --------------------------------------------------------------------------- #
+# 2. Dataset generation
+# --------------------------------------------------------------------------- #
 
 SEQ_LEN = 1000
 CHUNK_LEN = 60
-N_TOTAL = 3000
+N_TOTAL = 5000
 POS_N = N_TOTAL // 2
 NEG_N = N_TOTAL - POS_N
 
-X, y, masks = [], [], []  # data, label, ground-truth mask (pos only)
+# Define GC content based on the global flag
+GC_POS = 0.55 if WITH_CONFOUNDER else 0.50
+GC_NEG = 0.50
+
+X, y, masks = [], [], []
 
 master_chunk = random_chunk(CHUNK_LEN)
 
 for _ in range(POS_N):
-    bg = sample_background(SEQ_LEN, gc=0.55)
-    conservation = random.uniform(0.50, 0.75)
+    bg = sample_background(SEQ_LEN, gc=GC_POS)
+    conservation = random.uniform(0.6, 0.9)
     chunk = mutate(master_chunk, conservation)
     seq, start = embed(bg, chunk)
     X.append(one_hot(seq))
@@ -91,106 +112,136 @@ for _ in range(POS_N):
     masks.append(mask)
 
 for _ in range(NEG_N):
-    bg = sample_background(SEQ_LEN, gc=0.50)
+    bg = sample_background(SEQ_LEN, gc=GC_NEG)
     X.append(one_hot(bg))
     y.append(0)
-    masks.append(np.zeros(SEQ_LEN, dtype=bool))  # empty mask
+    masks.append(np.zeros(SEQ_LEN, dtype=bool))
 
 X = torch.tensor(np.stack(X))          # (N,4,1000)
 y = torch.tensor(y, dtype=torch.float) # (N,)
 masks = np.stack(masks)                # (N,1000) bool
 
+
 class SeqDS(Dataset):
-    def __init__(self, xs, ys, ms): self.x, self.y, self.m = xs, ys, ms
-    def __len__(self): return len(self.x)
-    def __getitem__(self, idx): return self.x[idx], self.y[idx], self.m[idx]
+    def __init__(self, xs, ys, ms):
+        self.x, self.y, self.m = xs, ys, ms
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, idx):
+        return self.x[idx], self.y[idx], self.m[idx]
+
 
 ds = SeqDS(X, y, masks)
-train_ds, test_ds = random_split(ds, [int(0.8 * N_TOTAL), N_TOTAL - int(0.8 * N_TOTAL)],
-                                 generator=torch.Generator().manual_seed(42))
+train_ds, test_ds = random_split(
+    ds,
+    [int(0.8 * N_TOTAL), N_TOTAL - int(0.8 * N_TOTAL)],
+    generator=torch.Generator().manual_seed(42)
+)
 train_dl = DataLoader(train_ds, batch_size=64, shuffle=True)
-test_dl  = DataLoader(test_ds , batch_size=128)
+test_dl = DataLoader(test_ds, batch_size=128)
 
-# ---------- 3. model -------------------------------------------------------------
+
+# --------------------------------------------------------------------------- #
+# 3. Model definition
+# --------------------------------------------------------------------------- #
 
 class TinyCNN(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv1d(4, 32, 7, padding=3)
+        self.conv1 = nn.Conv1d(4, 32, 13, padding=6)
         self.conv2 = nn.Conv1d(32, 64, 7, padding=3)
-        self.conv3 = nn.Conv1d(64,128, 7, padding=3)
-        self.fc1   = nn.Linear(128 * (SEQ_LEN // 8), 128)
-        self.out   = nn.Linear(128, 1)
+        self.conv3 = nn.Conv1d(64, 128, 7, padding=3)
+        self.pool = nn.AdaptiveMaxPool1d(1)
+        self.fc   = nn.Linear(128, 1)
 
     def forward(self, x):
         x = F.relu(self.conv1(x)); x = F.max_pool1d(x, 2)
         x = F.relu(self.conv2(x)); x = F.max_pool1d(x, 2)
         x = F.relu(self.conv3(x)); x = F.max_pool1d(x, 2)
-        x = x.flatten(1)
-        x = F.relu(self.fc1(x))
-        return torch.sigmoid(self.out(x)).squeeze(1)
+        x = self.pool(x).squeeze(-1)
+        logits = self.fc(x) # Return raw logits
+        return logits.squeeze(-1)
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = TinyCNN().to(device)
 opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-bce = nn.BCELoss()
+bce = nn.BCEWithLogitsLoss()
 
-# ---------- 4. training functions ------------------------------------------------
 
-def train_standard(model, train_dl, bce, opt, device, epochs=8):
+# --------------------------------------------------------------------------- #
+# 4. Training functions
+# --------------------------------------------------------------------------- #
+
+def train_standard(model, loader, loss_fn, optimizer, dev, epochs: int = 10) -> None:
     print("Starting standard training...")
     for epoch in range(epochs):
         model.train()
-        for xb, yb, _ in train_dl:
-            xb, yb = xb.to(device), yb.to(device)
-            opt.zero_grad()
-            loss = bce(model(xb), yb)
+        for xb, yb, _ in loader:
+            xb, yb = xb.to(dev), yb.to(dev)
+            optimizer.zero_grad()
+            loss = loss_fn(model(xb), yb)
             loss.backward()
-            opt.step()
-        print(f"  Epoch {epoch+1}/{epochs} completed.")
+            optimizer.step()
+        print(f"  Epoch {epoch + 1}/{epochs} completed.")
 
-def train_robust(model, train_dl, bce, opt, device, eps, epochs=8):
-    print(f"Starting robust (FGSM) training with eps={eps}...")
-    atk = torchattacks.FGSM(model, eps=eps)
+
+def train_robust(model, loader, loss_fn, optimizer, dev,
+                 eps: float, epochs: int = 10) -> None:
+    print(f"Starting robust (FGSM) training with eps = {eps} ...")
     for epoch in range(epochs):
         model.train()
-        for xb, yb, _ in train_dl:
-            xb, yb = xb.to(device), yb.to(device)
+        for xb, yb, _ in loader:
+            xb, yb = xb.to(dev), yb.to(dev)
             
-            # Generate adversarial examples
-            adv_xb = atk(xb, yb)
-            
-            opt.zero_grad()
-            loss = bce(model(adv_xb), yb)
+            # --- Manual FGSM Attack Generation on Logits ---
+            xb.requires_grad = True
+            logits = model(xb)
+            loss = loss_fn(logits, yb)
+            model.zero_grad()
             loss.backward()
-            opt.step()
-        print(f"  Epoch {epoch+1}/{epochs} completed.")
+            grad = xb.grad.data
+            adv_xb = (xb + eps * grad.sign()).detach()
+            # --- End Attack ---
 
-# ---------- 5. evaluation function -----------------------------------------------
+            optimizer.zero_grad()
+            logits_adv = model(adv_xb)
+            loss_adv = loss_fn(logits_adv, yb)
+            loss_adv.backward()
+            optimizer.step()
+        print(f"  Epoch {epoch + 1}/{epochs} completed.")
 
-def evaluate_model(model, model_name: str, test_ds, device, produce_plots=True):
+
+# --------------------------------------------------------------------------- #
+# 5. Attribution-based evaluation (Integrated Gradients & Grad-CAM)
+# --------------------------------------------------------------------------- #
+
+def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = True):
     print(f"Evaluating model: {model_name}")
-    
     SAMPLE_N = 300
-    ANALYSIS_CHUNK_LEN = 100 # Researcher's assumption of window size
+    ANALYSIS_CHUNK_LEN = 60  # assumed window size
 
-    # Accuracy
+    # -- accuracy ----------------------------------------------------------------
     model.eval()
     correct, total = 0, 0
     with torch.no_grad():
         for xb, yb, _ in test_dl:
-            xb, yb = xb.to(device), yb.to(device)
-            preds = (model(xb) > 0.5).float()
+            xb, yb = xb.to(dev), yb.to(dev)
+            logits = model(xb)
+            preds = (torch.sigmoid(logits) > 0.5).float()
             correct += (preds == yb).sum().item()
-            total   += len(yb)
-    print(f"Test accuracy: {correct/total:.3f}")
+            total += len(yb)
+    accuracy = correct / total if total else 0
+    print(f"Test accuracy: {accuracy:.3f}")
 
-    # IG Attribution
+    # -- Integrated Gradients ----------------------------------------------------
     def model_for_captum(x):
         return model(x).unsqueeze(-1)
 
     ig = IntegratedGradients(model_for_captum)
-    
+
     positive_subset_indices = [
         i for i, original_idx in enumerate(test_ds.indices)
         if test_ds.dataset.m[original_idx].sum() > 0
@@ -199,209 +250,406 @@ def evaluate_model(model, model_name: str, test_ds, device, produce_plots=True):
     rng = np.random.default_rng(0)
     sample_n_actual = min(SAMPLE_N, len(positive_subset_indices))
     if sample_n_actual < SAMPLE_N:
-        print(f"Warning: Found only {sample_n_actual} positive samples, less than the requested {SAMPLE_N}.")
-    idxs = rng.choice(positive_subset_indices, size=sample_n_actual, replace=False)
+        print(f"Warning: only {sample_n_actual} positive samples found "
+              f"(requested {SAMPLE_N}).")
+    idxs = rng.choice(positive_subset_indices,
+                      size=sample_n_actual,
+                      replace=False)
 
     results = []
     for idx in idxs:
         xb, _, mask = test_ds[idx]
-        xb = xb.unsqueeze(0).to(device)
-        attributions = ig.attribute(xb, target=0).abs().sum(1).squeeze(0).cpu().numpy()
+        xb = xb.unsqueeze(0).to(dev)
+        attributions = (
+            ig.attribute(xb, target=0)
+              .abs()
+              .sum(1)
+              .squeeze(0)
+              .cpu()
+              .numpy()
+        )
 
-        # 1. IoU (original method)
+        # 1. IoU (top-k mask)
         topk_idx = np.argsort(attributions)[-ANALYSIS_CHUNK_LEN:]
-        pred_mask_pos = np.zeros(SEQ_LEN, dtype=bool); pred_mask_pos[topk_idx] = True
+        pred_mask_pos = np.zeros(SEQ_LEN, dtype=bool)
+        pred_mask_pos[topk_idx] = True
         inter_pos = (pred_mask_pos & mask).sum()
         union_pos = (pred_mask_pos | mask).sum()
-        iou_pos = (inter_pos / union_pos if union_pos else 0)
+        iou_pos = inter_pos / union_pos if union_pos else 0
 
-        # 2. wIoU
-        window_sums = np.convolve(attributions, np.ones(ANALYSIS_CHUNK_LEN), 'valid')
+        # 2. contiguous wIoU
+        window_sums = np.convolve(attributions,
+                                  np.ones(ANALYSIS_CHUNK_LEN),
+                                  mode='valid')
         best_window_start = np.argmax(window_sums)
         pred_mask_cont = np.zeros(SEQ_LEN, dtype=bool)
-        pred_mask_cont[best_window_start:best_window_start + ANALYSIS_CHUNK_LEN] = True
+        pred_mask_cont[
+            best_window_start:best_window_start + ANALYSIS_CHUNK_LEN
+        ] = True
         inter_cont = (pred_mask_cont & mask).sum()
         union_cont = (pred_mask_cont | mask).sum()
-        iou_cont = (inter_cont / union_cont if union_cont else 0)
+        iou_cont = inter_cont / union_cont if union_cont else 0
 
-        results.append({'iou_pos': iou_pos, 'iou_cont': iou_cont, 
-                        'attributions': attributions, 'mask': mask,
-                        'cont_start': best_window_start})
+        # 3. Saliency AUC
+        inside_scores = attributions[mask]
+        outside_scores = attributions[~mask]
+        # Efficiently calculate AUC: probability that a random inside score is > a random outside score
+        saliency_auc = (inside_scores[:, None] > outside_scores[None, :]).mean()
 
-    if results:
-        results.sort(key=lambda x: x['iou_cont'])
-        mean_iou_pos = np.mean([r['iou_pos'] for r in results])
-        mean_iou_cont = np.mean([r['iou_cont'] for r in results])
-        print(f"Mean IoU over {len(results)} positive samples: {mean_iou_pos:.3f}")
-        print(f"Mean wIoU over {len(results)} positive samples: {mean_iou_cont:.3f}")
-        print(f"Note: wIoU = {CHUNK_LEN/ANALYSIS_CHUNK_LEN:.2f} is the best maximum achievable when {ANALYSIS_CHUNK_LEN}bp window overlaps perfectly with {CHUNK_LEN}bp ground truth")
+        results.append(
+            dict(iou_pos=iou_pos,
+                 iou_cont=iou_cont,
+                 saliency_auc=saliency_auc,
+                 attributions=attributions,
+                 mask=mask,
+                 cont_start=best_window_start)
+        )
 
-        if not produce_plots:
-            return mean_iou_cont
-
-        # Plotting (sorted by wIoU)
-        fig, axs = plt.subplots(3, 2, figsize=(15, 12))
-        fig.suptitle(f'IG Scores vs. Sequence Position ({model_name.title()} Model, Sorted by wIoU)')
-        
-        n_res = len(results)
-        mid1_idx, mid2_idx = n_res // 2 - 1, n_res // 2
-        
-        plot_data = [results[0], results[1], 
-                     results[mid1_idx], results[mid2_idx], 
-                     results[-2], results[-1]]
-        titles = ['Worst IoU 1', 'Worst IoU 2', 
-                  'Middle IoU 1', 'Middle IoU 2',
-                  'Best IoU 2', 'Best IoU 1']
-
-        for i, (ax, data, title) in enumerate(zip(axs.flat, plot_data, titles)):
-            ax.plot(data['attributions'], label='IG Score', color='black', linewidth=0.7)
-            title_str = (f"{title}\\n"
-                         f"wIoU: {data['iou_cont']:.3f}, "
-                         f"IoU: {data['iou_pos']:.3f}")
-            ax.set_title(title_str)
-            ax.set_xlabel("Sequence Position")
-            ax.set_ylabel("IG Score")
-            ax.grid(True, linestyle='--', alpha=0.6)
-            
-            # Highlight ground truth (red) and predicted contiguous block (blue)
-            gt_start = np.where(data['mask'])[0][0]
-            ax.axvspan(gt_start, gt_start + CHUNK_LEN, color='red', alpha=0.2, lw=0, label=f'Ground Truth ({CHUNK_LEN}bp)')
-            
-            pred_start = data['cont_start']
-            ax.axvspan(pred_start, pred_start + ANALYSIS_CHUNK_LEN, color='blue', alpha=0.2, lw=0, label=f'Predicted Block ({ANALYSIS_CHUNK_LEN}bp)')
-            ax.legend()
-
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.savefig(f"{model_name}_ig_scores_plot.png")
-        print(f"Saved plot to {model_name}_ig_scores_plot.png")
-
-        # Plotting distributions
-        ious_pos = [r['iou_pos'] for r in results]
-        ious_cont = [r['iou_cont'] for r in results]
-
-        fig_dist, axs_dist = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
-        fig_dist.suptitle(f'Distribution of IoU Scores for Positive Samples ({model_name.title()} Model)')
-
-        axs_dist[0].hist(ious_pos, bins=20, alpha=0.75, color='royalblue')
-        axs_dist[0].set_title('IoU')
-        axs_dist[0].set_xlabel('IoU Score')
-        axs_dist[0].set_ylabel('Frequency')
-        axs_dist[0].grid(True, linestyle='--', alpha=0.6)
-
-        axs_dist[1].hist(ious_cont, bins=20, alpha=0.75, color='firebrick')
-        axs_dist[1].set_title('wIoU')
-        axs_dist[1].set_xlabel('IoU Score')
-        axs_dist[1].grid(True, linestyle='--', alpha=0.6)
-
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.savefig(f"{model_name}_iou_distributions.png")
-        print(f"Saved IoU distribution plot to {model_name}_iou_distributions.png")
-        return mean_iou_cont
-
-    else:
+    if not results:
         print("No positives in sample set – increase SAMPLE_N.")
-        if not produce_plots:
-            return 0.0
+        return (0.0, 0.0, 0.0) if not produce_plots else (0.0, accuracy, 0.0)
 
-# ---------- 6. Main Execution Logic ---------------------------------------------
+    # -- statistics --------------------------------------------------------------
+    results.sort(key=lambda r: r['iou_cont'])
+    mean_iou_pos = np.mean([r['iou_pos'] for r in results])
+    mean_iou_cont = np.mean([r['iou_cont'] for r in results])
+    mean_saliency_auc = np.mean([r['saliency_auc'] for r in results])
+    print(f"Mean IoU  : {mean_iou_pos:.3f} on {len(results)} positive samples")
+    print(f"Mean wIoU : {mean_iou_cont:.3f}")
+    print(f"Mean Saliency AUC: {mean_saliency_auc:.3f}")
 
-def run_single_experiment(seed, epsilons_to_test):
-    """
-    Runs the full experiment for a single seed.
-    1. Generates data
-    2. Trains a standard model and evaluates its wIoU.
-    3. Trains a robust model for each epsilon and evaluates its wIoU.
-    Returns the wIoU for the standard model and a list of wIoUs for the robust models.
-    """
-    print(f"\n{'='*20} RUNNING FOR SEED: {seed} {'='*20}")
+    if not produce_plots:
+        return mean_iou_cont, accuracy, mean_saliency_auc
+
+    # -- plotting ----------------------------------------------------------------
+    fig, axs = plt.subplots(3, 2, figsize=(15, 12))
+    fig.suptitle(
+        f'IG scores vs. position ({model_name.title()}, sorted by wIoU)'
+    )
+    n_res = len(results)
+    mid1, mid2 = n_res // 2 - 1, n_res // 2
+    plot_data = [results[0], results[1],
+                 results[mid1], results[mid2],
+                 results[-2], results[-1]]
+    titles = ['Worst 1', 'Worst 2',
+              'Median 1', 'Median 2',
+              'Best 2', 'Best 1']
+
+    for ax, data, title in zip(axs.flat, plot_data, titles):
+        ax.plot(data['attributions'],
+                label='IG score',
+                color='black',
+                linewidth=0.7)
+        ax.set_title(f"{title}\nwIoU={data['iou_cont']:.3f}, "
+                     f"IoU={data['iou_pos']:.3f}, AUC={data['saliency_auc']:.3f}")
+        ax.set_xlabel("Position")
+        ax.set_ylabel("IG score")
+        ax.grid(True, ls='--', alpha=0.6)
+
+        # highlight true & predicted block
+        gt_start = np.where(data['mask'])[0][0]
+        ax.axvspan(gt_start,
+                   gt_start + CHUNK_LEN,
+                   color='red',
+                   alpha=0.2,
+                   lw=0,
+                   label=f'Ground truth ({CHUNK_LEN} bp)')
+        pred_start = data['cont_start']
+        ax.axvspan(pred_start,
+                   pred_start + ANALYSIS_CHUNK_LEN,
+                   color='blue',
+                   alpha=0.2,
+                   lw=0,
+                   label=f'Predicted ({ANALYSIS_CHUNK_LEN} bp)')
+        ax.legend()
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(f"{model_name}_ig_scores_plot.png")
+    print(f"Saved plot → {model_name}_ig_scores_plot.png")
+
+    # -- distribution plots ------------------------------------------------------
+    ious_pos = [r['iou_pos'] for r in results]
+    ious_cont = [r['iou_cont'] for r in results]
+
+    fig_dist, axs_dist = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
+    fig_dist.suptitle(f'IoU distributions ({model_name.title()})')
+
+    axs_dist[0].hist(ious_pos, bins=20, alpha=0.75)
+    axs_dist[0].set_title('IoU')
+    axs_dist[0].set_xlabel('Score')
+    axs_dist[0].set_ylabel('Frequency')
+    axs_dist[0].grid(True, ls='--', alpha=0.6)
+
+    axs_dist[1].hist(ious_cont, bins=20, alpha=0.75)
+    axs_dist[1].set_title('wIoU')
+    axs_dist[1].set_xlabel('Score')
+    axs_dist[1].grid(True, ls='--', alpha=0.6)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(f"{model_name}_iou_distributions.png")
+    print(f"Saved plot → {model_name}_iou_distributions.png")
+
+    return mean_iou_cont, accuracy, mean_saliency_auc
+
+
+def analyze_adversarial_examples(model, test_ds, dev, loss_fn, eps=0.01):
+    print("\n--- Adversarial Example Analysis ---")
+
+    positive_indices = [i for i, (_, y, _) in enumerate(test_ds) if y == 1]
     
-    # 1. Generate data for this specific seed
+    analysis_results = {
+        "pert_in_chunk": [], "pert_in_bg": [],
+        "gc_pert_sum": [], "at_pert_sum": []
+    }
+
+    print(f"  Analyzing {len(positive_indices)} positive samples...")
+    for idx in positive_indices:
+        xb, _, mask = test_ds[idx]
+        xb = xb.unsqueeze(0).to(dev)
+        yb = torch.tensor([1.0], device=dev)
+        
+        # Manually generate adversarial example
+        xb.requires_grad = True
+        logits = model(xb)
+        loss = loss_fn(logits, yb)
+        model.zero_grad()
+        loss.backward()
+        grad = xb.grad.data
+        adv_xb = (xb + eps * grad.sign()).detach()
+        
+        delta = adv_xb - xb
+        mask_t = torch.from_numpy(mask).to(dev)
+
+        analysis_results["pert_in_chunk"].append(delta[:, :, mask_t].abs().mean().item())
+        analysis_results["pert_in_bg"].append(delta[:, :, ~mask_t].abs().mean().item())
+        
+        gc_channels = [to_ix['G'], to_ix['C']]
+        at_channels = [to_ix['A'], to_ix['T']]
+        analysis_results["gc_pert_sum"].append(delta[:, gc_channels, :].sum().item())
+        analysis_results["at_pert_sum"].append(delta[:, at_channels, :].sum().item())
+
+    # Generate a 2x2 boxplot for the collected metrics
+    fig, axs = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle(f'Distribution of FGSM Perturbation Effects (eps={eps})', fontsize=16)
+
+    # Plot 1: Mean Perturbation Magnitude
+    axs[0, 0].boxplot([analysis_results["pert_in_chunk"], analysis_results["pert_in_bg"]], 
+                    labels=['Causal Chunk', 'Background'])
+    axs[0, 0].set_title('Mean Perturbation Magnitude (L1 norm)')
+    axs[0, 0].set_ylabel('Mean |Δ|')
+    axs[0, 0].grid(True, linestyle='--', alpha=0.7)
+
+    # Plot 2: Net Perturbation on GC vs AT
+    axs[0, 1].boxplot([analysis_results["gc_pert_sum"], analysis_results["at_pert_sum"]], 
+                    labels=['GC Channels', 'AT Channels'])
+    axs[0, 1].set_title('Net Sum of Perturbations by Base Type')
+    axs[0, 1].set_ylabel('Sum(Δ)')
+    axs[0, 1].grid(True, linestyle='--', alpha=0.7)
+    
+    # Plot 3 & 4: Histograms for finer detail
+    axs[1, 0].hist(analysis_results["pert_in_bg"], bins=50, alpha=0.75, color='cornflowerblue')
+    axs[1, 0].set_title('Distribution of Mean Perturbation in Background')
+    axs[1, 0].set_xlabel('Mean |Δ| in Background')
+    axs[1, 0].set_ylabel('Frequency')
+    axs[1, 0].grid(True, linestyle='--', alpha=0.7)
+
+    axs[1, 1].hist(analysis_results["gc_pert_sum"], bins=50, alpha=0.75, color='salmon')
+    axs[1, 1].axvline(0, color='black', linestyle='--', lw=1.5)
+    axs[1, 1].set_title('Distribution of Net Perturbation on GC Channels')
+    axs[1, 1].set_xlabel('Sum of Perturbations (GC Channels)')
+    axs[1, 1].set_ylabel('Frequency')
+    axs[1, 1].grid(True, linestyle='--', alpha=0.7)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig("adversarial_perturbation_analysis_seed1.png")
+    print("\nSaved plot → adversarial_perturbation_analysis_seed1.png")
+
+
+# --------------------------------------------------------------------------- #
+# 6. Experiment helpers
+# --------------------------------------------------------------------------- #
+
+def run_single_experiment(seed: int, epsilons_to_test: List[float], train_ds, test_ds):
+    """
+    1 Generates data for the seed
+    2 Trains a standard model and evaluates wIoU & acc
+    3 Trains robust models for each epsilon, evaluates each
+    """
+    print(f"\n{'=' * 20}  SEED {seed}  {'=' * 20}")
+
+    # Use the provided datasets
+    train_dl = DataLoader(train_ds, batch_size=64, shuffle=True)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    bce = nn.BCEWithLogitsLoss()
+
+    # standard model ------------------------------------------------------------
     set_seeds(seed)
+    standard_model = TinyCNN().to(dev)
+    opt_standard = torch.optim.Adam(standard_model.parameters(), lr=1e-3)
+    train_standard(standard_model, train_dl, bce, opt_standard, dev)
+    std_wiou, std_acc, std_auc = evaluate_model(standard_model,
+                                       f"standard_seed{seed}",
+                                       test_ds,
+                                       dev,
+                                       produce_plots=False)
+
+    # robust models -------------------------------------------------------------
+    robust_wious, robust_accs, robust_aucs = [], [], []
+    for eps in epsilons_to_test:
+        set_seeds(seed)
+        mdl = TinyCNN().to(dev)
+        opt = torch.optim.Adam(mdl.parameters(), lr=1e-3)
+        train_robust(mdl, train_dl, bce, opt, dev, eps=eps, epochs=10)
+        wio, acc, auc = evaluate_model(mdl,
+                                  f"robust_eps{eps}_seed{seed}",
+                                  test_ds,
+                                  dev,
+                                  produce_plots=False)
+        robust_wious.append(wio)
+        robust_accs.append(acc)
+        robust_aucs.append(auc)
+
+    return std_wiou, std_acc, std_auc, robust_wious, robust_accs, robust_aucs
+
+
+# --------------------------------------------------------------------------- #
+# 7. Main entry-point
+# --------------------------------------------------------------------------- #
+
+if __name__ == "__main__":
+    
+    # Generate the single, large dataset for all experiments
+    print(f"--- Generating a single dataset of size {N_TOTAL} ---")
+    set_seeds(42) # Use a fixed seed for dataset generation
     master_chunk = random_chunk(CHUNK_LEN)
     X, y, masks = [], [], []
     for _ in range(POS_N):
-        bg = sample_background(SEQ_LEN, gc=0.60)
-        conservation = random.uniform(0.50, 0.75)
+        bg = sample_background(SEQ_LEN, gc=GC_POS)
+        conservation = random.uniform(0.6, 0.9)
         chunk = mutate(master_chunk, conservation)
         seq, start = embed(bg, chunk)
-        X.append(one_hot(seq))
-        y.append(1)
-        m = np.zeros(SEQ_LEN, dtype=bool); m[start:start + CHUNK_LEN] = True
-        masks.append(m)
+        X.append(one_hot(seq)); y.append(1)
+        m = np.zeros(SEQ_LEN, dtype=bool); m[start:start + CHUNK_LEN] = True; masks.append(m)
     for _ in range(NEG_N):
-        bg = sample_background(SEQ_LEN, gc=0.45)
-        X.append(one_hot(bg))
-        y.append(0)
+        bg = sample_background(SEQ_LEN, gc=GC_NEG)
+        X.append(one_hot(bg)); y.append(0)
         masks.append(np.zeros(SEQ_LEN, dtype=bool))
-    
+
     X = torch.tensor(np.stack(X)); y = torch.tensor(y, dtype=torch.float); masks = np.stack(masks)
     ds = SeqDS(X, y, masks)
-    train_ds, test_ds = random_split(ds, [int(0.8 * N_TOTAL), N_TOTAL - int(0.8 * N_TOTAL)],
-                                     generator=torch.Generator().manual_seed(seed))
-    train_dl = DataLoader(train_ds, batch_size=64, shuffle=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    bce = nn.BCELoss()
-
-    # 2. Train and evaluate standard model
-    set_seeds(seed)
-    standard_model = TinyCNN().to(device)
-    opt_standard = torch.optim.Adam(standard_model.parameters(), lr=1e-3)
-    train_standard(standard_model, train_dl, bce, opt_standard, device)
-    standard_wIou = evaluate_model(standard_model, f"standard_seed{seed}", test_ds, device, produce_plots=False)
-
-    # 3. Train and evaluate robust models for each epsilon
-    robust_wIous = []
-    for eps in epsilons_to_test:
-        set_seeds(seed) # Ensure every model starts from the same weights for this seed
-        model = TinyCNN().to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-        train_robust(model, train_dl, bce, optimizer, device, eps=eps, epochs=8)
-        mean_wIou = evaluate_model(model, f"robust_eps_{eps}_seed{seed}", test_ds, device, produce_plots=False)
-        robust_wIous.append(mean_wIou)
     
-    return standard_wIou, robust_wIous
+    # This split is now done once for all experiments
+    main_train_ds, main_test_ds = random_split(
+        ds,
+        [int(0.8 * N_TOTAL), N_TOTAL - int(0.8 * N_TOTAL)],
+        generator=torch.Generator().manual_seed(42)
+    )
 
+    print("--- single baseline run for visualisation ---")
+    set_seeds(1)
+    viz_model = TinyCNN().to(device)
+    viz_opt = torch.optim.Adam(viz_model.parameters(), lr=1e-3)
+    viz_train_dl = DataLoader(main_train_ds, batch_size=64, shuffle=True)
 
-# ---------- 7. Multi-Seed Experiment Aggregation --------------------------------
-SEEDS = [42, 123, 1024, 0, 99]
-epsilons = [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1]
-all_standard_wIous = []
-all_robust_wIous = [] # This will be a list of lists
+    train_standard(viz_model, viz_train_dl, bce, viz_opt, device)
+    evaluate_model(viz_model, "standard_baseline", main_test_ds, device, True)
+    # evaluate_model_gradcam(viz_model, "standard_baseline", main_test_ds, device, True)
+    
+    # --- Adversarial Analysis Section ---
+    print("\n--- Training a single FGSM model for analysis ---")
+    set_seeds(1)
+    fgsm_model_for_analysis = TinyCNN().to(device)
+    fgsm_opt = torch.optim.Adam(fgsm_model_for_analysis.parameters(), lr=1e-3)
+    train_robust(fgsm_model_for_analysis, viz_train_dl, bce, fgsm_opt, device, eps=0.01)
+    analyze_adversarial_examples(fgsm_model_for_analysis, main_test_ds, device, bce, eps=0.01)
 
-for seed in SEEDS:
-    standard_wIou, robust_wIous_for_seed = run_single_experiment(seed, epsilons)
-    all_standard_wIous.append(standard_wIou)
-    all_robust_wIous.append(robust_wIous_for_seed)
+    print("\n--- baseline plots generated. multi-seed experiments start ---\n")
 
-# Aggregate results
-standard_wIou_mean = np.mean(all_standard_wIous)
-standard_wIou_std = np.std(all_standard_wIous)
-robust_wIous_by_eps = np.array(all_robust_wIous)
-robust_mean_by_eps = np.mean(robust_wIous_by_eps, axis=0)
-robust_std_by_eps = np.std(robust_wIous_by_eps, axis=0)
+    SEEDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    EPSILONS = [0.001, 0.0025, 0.005, 0.01, 0.1]
+    all_std_wious, all_std_accs, all_std_aucs = [], [], []
+    all_rob_wious, all_rob_accs, all_rob_aucs = [], [], []
 
-# Plot the final aggregated results
-plt.figure(figsize=(12, 8))
-# Plot robust model results with variance
-plt.plot(epsilons, robust_mean_by_eps, marker='o', linestyle='-', label='Mean Robust Model wIoU')
-plt.fill_between(epsilons, robust_mean_by_eps - robust_std_by_eps, 
-                 robust_mean_by_eps + robust_std_by_eps, alpha=0.2, 
-                 label='Robust Model Std. Dev.')
+    for sd in SEEDS:
+        sw, sa, sa_auc, rw, ra, ra_auc = run_single_experiment(sd, EPSILONS, main_train_ds, main_test_ds)
+        all_std_wious.append(sw)
+        all_std_accs.append(sa)
+        all_std_aucs.append(sa_auc)
+        all_rob_wious.append(rw)
+        all_rob_accs.append(ra)
+        all_rob_aucs.append(ra_auc)
 
-# Plot standard model baseline with variance
-plt.axhline(y=standard_wIou_mean, color='r', linestyle='--', 
-            label=f'Mean Standard Model wIoU ({standard_wIou_mean:.3f})')
-plt.fill_between(epsilons, standard_wIou_mean - standard_wIou_std, 
-                 standard_wIou_mean + standard_wIou_std, color='r', alpha=0.1,
-                 label='Standard Model Std. Dev.')
+    # aggregate - wIoU
+    std_wiou_mean = np.mean(all_std_wious)
+    std_wiou_std = np.std(all_std_wious)
+    rob_wious_arr = np.array(all_rob_wious)
+    rob_mean = rob_wious_arr.mean(axis=0)
+    rob_std = rob_wious_arr.std(axis=0)
 
-plt.title('Impact of Epsilon on Model Interpretability (Averaged Over 5 Seeds)')
-plt.xlabel('Epsilon (Adversarial Perturbation Size)')
-plt.ylabel('Mean Windowed IoU (wIoU)')
-plt.xscale('log')
-plt.grid(True, which="both", ls="--")
-plt.legend()
-plt.savefig("multi_seed_fgsm_vs_wIou.png")
-print(f"\nSaved final multi-seed experiment plot to multi_seed_fgsm_vs_wIou.png")
+    # aggregate - accuracy
+    std_acc_mean = np.mean(all_std_accs)
+    std_acc_std = np.std(all_std_accs)
+    rob_acc_arr = np.array(all_rob_accs)
+    rob_acc_mean = rob_acc_arr.mean(axis=0)
+    rob_acc_std = rob_acc_arr.std(axis=0)
 
+    # aggregate - saliency AUC
+    std_auc_mean = np.mean(all_std_aucs)
+    std_auc_std = np.std(all_std_aucs)
+    rob_auc_arr = np.array(all_rob_aucs)
+    rob_auc_mean = rob_auc_arr.mean(axis=0)
+    rob_auc_std = rob_auc_arr.std(axis=0)
 
+    # plot wIoU vs eps
+    plt.figure(figsize=(12, 8))
+    plt.plot(EPSILONS, rob_mean, marker='o', label='Robust mean')
+    plt.fill_between(EPSILONS, rob_mean - rob_std, rob_mean + rob_std, alpha=0.2)
+    plt.axhline(std_wiou_mean, color='r', ls='--',
+                label=f'Standard mean ({std_wiou_mean:.3f})')
+    plt.fill_between(EPSILONS,
+                     std_wiou_mean - std_wiou_std,
+                     std_wiou_mean + std_wiou_std,
+                     color='r', alpha=0.1)
+    plt.xscale('log')
+    plt.xlabel('Epsilon')
+    plt.ylabel('Mean wIoU')
+    plt.title('Epsilon vs interpretability (5 seeds)')
+    plt.grid(True, which='both', ls='--')
+    plt.legend()
+    plt.savefig("multi_seed_fgsm_vs_wiou.png")
+    print("Saved plot → multi_seed_fgsm_vs_wiou.png")
+
+    # plot accuracy vs eps
+    plt.figure(figsize=(12, 8))
+    plt.plot(EPSILONS, rob_acc_mean, marker='o', label='Robust mean acc')
+    plt.fill_between(EPSILONS, rob_acc_mean - rob_acc_std,
+                     rob_acc_mean + rob_acc_std, alpha=0.2)
+    plt.axhline(std_acc_mean, color='r', ls='--',
+                label=f'Standard mean ({std_acc_mean:.3f})')
+    plt.fill_between(EPSILONS,
+                     std_acc_mean - std_acc_std,
+                     std_acc_mean + std_acc_std,
+                     color='r', alpha=0.1)
+    plt.xscale('log')
+    plt.xlabel('Epsilon')
+    plt.ylabel('Accuracy')
+    plt.title('Epsilon vs accuracy (5 seeds)')
+    plt.grid(True, which='both', ls='--')
+    plt.legend()
+    plt.savefig("multi_seed_fgsm_vs_acc.png")
+    print("Saved plot → multi_seed_fgsm_vs_acc.png")
+
+    # plot saliency AUC vs eps
+    plt.figure(figsize=(12, 8))
+    plt.plot(EPSILONS, rob_auc_mean, marker='o', label='Robust mean')
+    plt.fill_between(EPSILONS, rob_auc_mean - rob_auc_std, rob_auc_mean + rob_auc_std, alpha=0.2)
+    plt.axhline(std_auc_mean, color='r', ls='--', label=f'Standard mean ({std_auc_mean:.3f})')
+    plt.fill_between(EPSILONS, std_auc_mean - std_auc_std, std_auc_mean + std_auc_std, color='r', alpha=0.1)
+    plt.xscale('log')
+    plt.xlabel('Epsilon')
+    plt.ylabel('Mean Saliency AUC')
+    plt.title('Epsilon vs Saliency AUC (5 seeds)')
+    plt.grid(True, which='both', ls='--')
+    plt.legend()
+    plt.savefig("multi_seed_fgsm_vs_saliency_auc.png")
+    print("Saved plot → multi_seed_fgsm_vs_saliency_auc.png")
