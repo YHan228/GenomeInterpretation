@@ -28,6 +28,10 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 WITH_CONFOUNDER = True # Global switch for GC-content difference
 
+
+SEEDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+EPSILONS = [0.001, 0.0025, 0.005, 0.01, 0.05]
+
 def set_seeds(seed_value: int = 42) -> None:
     np.random.seed(seed_value)
     random.seed(seed_value)
@@ -82,6 +86,12 @@ def one_hot(seq: np.ndarray) -> np.ndarray:
     return arr
 
 
+def one_hot_to_seq(one_hot_tensor: torch.Tensor) -> str:
+    """ (4, L) float tensor -> (L,) string """
+    indices = torch.argmax(one_hot_tensor, dim=0).cpu().numpy()
+    return "".join(ALPH[indices])
+
+
 # --------------------------------------------------------------------------- #
 # 2. Dataset generation
 # --------------------------------------------------------------------------- #
@@ -93,7 +103,7 @@ POS_N = N_TOTAL // 2
 NEG_N = N_TOTAL - POS_N
 
 # Define GC content based on the global flag
-GC_POS = 0.55 if WITH_CONFOUNDER else 0.50
+GC_POS = 0.60 if WITH_CONFOUNDER else 0.50
 GC_NEG = 0.50
 
 X, y, masks = [], [], []
@@ -102,7 +112,7 @@ master_chunk = random_chunk(CHUNK_LEN)
 
 for _ in range(POS_N):
     bg = sample_background(SEQ_LEN, gc=GC_POS)
-    conservation = random.uniform(0.6, 0.9)
+    conservation = random.uniform(0.6, 0.8)
     chunk = mutate(master_chunk, conservation)
     seq, start = embed(bg, chunk)
     X.append(one_hot(seq))
@@ -188,30 +198,145 @@ def train_standard(model, loader, loss_fn, optimizer, dev, epochs: int = 10) -> 
         print(f"  Epoch {epoch + 1}/{epochs} completed.")
 
 
-def train_robust(model, loader, loss_fn, optimizer, dev,
-                 eps: float, epochs: int = 10) -> None:
-    print(f"Starting robust (FGSM) training with eps = {eps} ...")
+def generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction: float, 
+                              neighborhood_size: int = 20, penalize_nearby: bool = False):
+    """
+    Generates adversarial examples using iterative, greedy HotFlip.
+    Includes optional penalty for flipping bases in a local neighborhood.
+    """
+    seq_len = xb.shape[2]
+    k_flips = int(flip_fraction * seq_len)
+
+    if flip_fraction > 0.05:
+        print(f"Warning: HotFlip is changing {k_flips}/{seq_len} ({flip_fraction:.1%}) "
+              f"of bases, which is > 5%. This may be unrealistic.")
+
+    adv_xb = xb.clone()
+    forbidden_regions = torch.zeros_like(adv_xb[:, 0, :], dtype=torch.bool, device=xb.device)
+
+    for _ in range(k_flips):
+        adv_xb.requires_grad = True
+        model.zero_grad()
+        logits = model(adv_xb)
+        loss = loss_fn(logits, yb)
+        loss.backward()
+        grad = adv_xb.grad.data
+
+        current_bases_onehot = (adv_xb > 0.5).float()
+        grad_at_current_bases = (grad * current_bases_onehot).sum(dim=1, keepdim=True)
+        saliency_scores = grad - grad_at_current_bases
+        saliency_scores.masked_fill_(current_bases_onehot.bool(), -1e9)
+
+        best_flip_scores_per_pos, _ = saliency_scores.max(dim=1)
+        if penalize_nearby:
+            best_flip_scores_per_pos.masked_fill_(forbidden_regions, -1e9)
+        
+        best_pos_to_flip = best_flip_scores_per_pos.argmax(dim=1)
+        best_new_base_idx = saliency_scores[range(len(xb)), :, best_pos_to_flip].argmax(dim=1)
+
+        old_base_idx = adv_xb[range(len(xb)), :, best_pos_to_flip].argmax(dim=1)
+        adv_xb = adv_xb.detach()
+        adv_xb[range(len(xb)), old_base_idx, best_pos_to_flip] = 0.0
+        adv_xb[range(len(xb)), best_new_base_idx, best_pos_to_flip] = 1.0
+        
+        if penalize_nearby:
+            for i in range(len(xb)):
+                pos = best_pos_to_flip[i].item()
+                start = max(0, pos - neighborhood_size)
+                end = min(seq_len, pos + neighborhood_size + 1)
+                forbidden_regions[i, start:end] = True
+
+    return adv_xb
+
+
+def train_hotflip(model, loader, loss_fn, optimizer, dev,
+                  flip_fraction: float, epochs: int = 10) -> None:
+    print(f"Starting HotFlip training with flip_fraction = {flip_fraction:.4f} ...")
     for epoch in range(epochs):
         model.train()
         for xb, yb, _ in loader:
             xb, yb = xb.to(dev), yb.to(dev)
-            
-            # --- Manual FGSM Attack Generation on Logits ---
-            xb.requires_grad = True
-            logits = model(xb)
-            loss = loss_fn(logits, yb)
-            model.zero_grad()
-            loss.backward()
-            grad = xb.grad.data
-            adv_xb = (xb + eps * grad.sign()).detach()
-            # --- End Attack ---
 
+            # Generate adversarial examples for the batch
+            adv_xb = generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction)
+            
             optimizer.zero_grad()
             logits_adv = model(adv_xb)
             loss_adv = loss_fn(logits_adv, yb)
             loss_adv.backward()
             optimizer.step()
         print(f"  Epoch {epoch + 1}/{epochs} completed.")
+
+
+def train_standard_verbose(model, loader, loss_fn, optimizer, dev, epochs: int = 10) -> None:
+    print("Starting verbose standard training...")
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        correct_preds = 0
+        total_samples = 0
+        num_batches = len(loader)
+        for i, (xb, yb, _) in enumerate(loader):
+            xb, yb = xb.to(dev), yb.to(dev)
+            
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = loss_fn(logits, yb)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            preds = (torch.sigmoid(logits) > 0.5).float()
+            correct_preds += (preds == yb).sum().item()
+            total_samples += len(yb)
+            
+            if (i + 1) % 10 == 0:
+                avg_loss = running_loss / 10
+                avg_acc = correct_preds / total_samples
+                print(f"  Epoch {epoch+1}, Batch {i+1}/{num_batches} | "
+                      f"Avg Loss (last 10): {avg_loss:.4f} | "
+                      f"Running Acc: {avg_acc:.4f}")
+                running_loss = 0.0
+        
+        epoch_acc = correct_preds / total_samples
+        print(f"  Epoch {epoch + 1}/{epochs} completed. Final Training Accuracy: {epoch_acc:.4f}")
+
+
+def train_hotflip_verbose(model, loader, loss_fn, optimizer, dev,
+                          flip_fraction: float, epochs: int = 10) -> None:
+    print(f"Starting verbose HotFlip training with flip_fraction = {flip_fraction:.4f} ...")
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        correct_preds = 0
+        total_samples = 0
+        num_batches = len(loader)
+        for i, (xb, yb, _) in enumerate(loader):
+            xb, yb = xb.to(dev), yb.to(dev)
+
+            adv_xb = generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction)
+            
+            optimizer.zero_grad()
+            logits_adv = model(adv_xb)
+            loss_adv = loss_fn(logits_adv, yb)
+            loss_adv.backward()
+            optimizer.step()
+
+            running_loss += loss_adv.item()
+            preds = (torch.sigmoid(logits_adv) > 0.5).float()
+            correct_preds += (preds == yb).sum().item()
+            total_samples += len(yb)
+
+            if (i + 1) % 10 == 0:
+                avg_loss = running_loss / 10
+                avg_acc = correct_preds / total_samples
+                print(f"  Epoch {epoch+1}, Batch {i+1}/{num_batches} | "
+                      f"Avg Adv Loss (last 10): {avg_loss:.4f} | "
+                      f"Running Adv Acc: {avg_acc:.4f}")
+                running_loss = 0.0
+
+        epoch_acc = correct_preds / total_samples
+        print(f"  Epoch {epoch + 1}/{epochs} completed. Final Adversarial Training Accuracy: {epoch_acc:.4f}")
 
 
 # --------------------------------------------------------------------------- #
@@ -269,15 +394,7 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
               .numpy()
         )
 
-        # 1. IoU (top-k mask)
-        topk_idx = np.argsort(attributions)[-ANALYSIS_CHUNK_LEN:]
-        pred_mask_pos = np.zeros(SEQ_LEN, dtype=bool)
-        pred_mask_pos[topk_idx] = True
-        inter_pos = (pred_mask_pos & mask).sum()
-        union_pos = (pred_mask_pos | mask).sum()
-        iou_pos = inter_pos / union_pos if union_pos else 0
-
-        # 2. contiguous wIoU
+        # 1. contiguous wIoU
         window_sums = np.convolve(attributions,
                                   np.ones(ANALYSIS_CHUNK_LEN),
                                   mode='valid')
@@ -290,15 +407,14 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
         union_cont = (pred_mask_cont | mask).sum()
         iou_cont = inter_cont / union_cont if union_cont else 0
 
-        # 3. Saliency AUC
+        # 2. Saliency AUC
         inside_scores = attributions[mask]
         outside_scores = attributions[~mask]
         # Efficiently calculate AUC: probability that a random inside score is > a random outside score
         saliency_auc = (inside_scores[:, None] > outside_scores[None, :]).mean()
 
         results.append(
-            dict(iou_pos=iou_pos,
-                 iou_cont=iou_cont,
+            dict(iou_cont=iou_cont,
                  saliency_auc=saliency_auc,
                  attributions=attributions,
                  mask=mask,
@@ -311,11 +427,9 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
 
     # -- statistics --------------------------------------------------------------
     results.sort(key=lambda r: r['iou_cont'])
-    mean_iou_pos = np.mean([r['iou_pos'] for r in results])
     mean_iou_cont = np.mean([r['iou_cont'] for r in results])
     mean_saliency_auc = np.mean([r['saliency_auc'] for r in results])
-    print(f"Mean IoU  : {mean_iou_pos:.3f} on {len(results)} positive samples")
-    print(f"Mean wIoU : {mean_iou_cont:.3f}")
+    print(f"Mean wIoU : {mean_iou_cont:.3f} on {len(results)} positive samples")
     print(f"Mean Saliency AUC: {mean_saliency_auc:.3f}")
 
     if not produce_plots:
@@ -340,8 +454,7 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
                 label='IG score',
                 color='black',
                 linewidth=0.7)
-        ax.set_title(f"{title}\nwIoU={data['iou_cont']:.3f}, "
-                     f"IoU={data['iou_pos']:.3f}, AUC={data['saliency_auc']:.3f}")
+        ax.set_title(f"{title}\nwIoU={data['iou_cont']:.3f}, AUC={data['saliency_auc']:.3f}")
         ax.set_xlabel("Position")
         ax.set_ylabel("IG score")
         ax.grid(True, ls='--', alpha=0.6)
@@ -368,101 +481,143 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
     print(f"Saved plot → {model_name}_ig_scores_plot.png")
 
     # -- distribution plots ------------------------------------------------------
-    ious_pos = [r['iou_pos'] for r in results]
-    ious_cont = [r['iou_cont'] for r in results]
+    wious = [r['iou_cont'] for r in results]
+    saliency_aucs = [r['saliency_auc'] for r in results]
 
-    fig_dist, axs_dist = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
-    fig_dist.suptitle(f'IoU distributions ({model_name.title()})')
+    fig_dist, axs_dist = plt.subplots(1, 2, figsize=(12, 5))
+    fig_dist.suptitle(f'Evaluation Metric Distributions ({model_name.title()})')
 
-    axs_dist[0].hist(ious_pos, bins=20, alpha=0.75)
-    axs_dist[0].set_title('IoU')
+    axs_dist[0].hist(wious, bins=20, alpha=0.75)
+    axs_dist[0].set_title('Windowed IoU (wIoU)')
     axs_dist[0].set_xlabel('Score')
     axs_dist[0].set_ylabel('Frequency')
     axs_dist[0].grid(True, ls='--', alpha=0.6)
 
-    axs_dist[1].hist(ious_cont, bins=20, alpha=0.75)
-    axs_dist[1].set_title('wIoU')
+    axs_dist[1].hist(saliency_aucs, bins=20, alpha=0.75)
+    axs_dist[1].set_title('Saliency AUC')
     axs_dist[1].set_xlabel('Score')
     axs_dist[1].grid(True, ls='--', alpha=0.6)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(f"{model_name}_iou_distributions.png")
-    print(f"Saved plot → {model_name}_iou_distributions.png")
+    plt.savefig(f"{model_name}_metric_distributions.png")
+    print(f"Saved plot → {model_name}_metric_distributions.png")
 
     return mean_iou_cont, accuracy, mean_saliency_auc
 
 
-def analyze_adversarial_examples(model, test_ds, dev, loss_fn, eps=0.01):
+def analyze_adversarial_examples(model, test_ds, dev, loss_fn, flip_fraction: float):
     print("\n--- Adversarial Example Analysis ---")
-
+    k_flips = int(flip_fraction * SEQ_LEN)
     positive_indices = [i for i, (_, y, _) in enumerate(test_ds) if y == 1]
     
-    analysis_results = {
-        "pert_in_chunk": [], "pert_in_bg": [],
-        "gc_pert_sum": [], "at_pert_sum": []
-    }
+    if not positive_indices:
+        print("No positive examples found for analysis.")
+        return
 
-    print(f"  Analyzing {len(positive_indices)} positive samples...")
+    counts = {
+        'chunk': {'at_to_gc': 0, 'gc_to_at': 0, 'at_to_at': 0, 'gc_to_gc': 0},
+        'bg': {'at_to_gc': 0, 'gc_to_at': 0, 'at_to_at': 0, 'gc_to_gc': 0}
+    }
+    gc_bases = {'G', 'C'}
+    all_flip_distances = []
+
+    print(f"  Analyzing flips for {len(positive_indices)} positive samples...")
     for idx in positive_indices:
         xb, _, mask = test_ds[idx]
         xb = xb.unsqueeze(0).to(dev)
         yb = torch.tensor([1.0], device=dev)
         
-        # Manually generate adversarial example
-        xb.requires_grad = True
-        logits = model(xb)
-        loss = loss_fn(logits, yb)
-        model.zero_grad()
-        loss.backward()
-        grad = xb.grad.data
-        adv_xb = (xb + eps * grad.sign()).detach()
+        adv_xb = generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction)
         
-        delta = adv_xb - xb
-        mask_t = torch.from_numpy(mask).to(dev)
+        original_seq_str = one_hot_to_seq(xb.squeeze(0))
+        adv_seq_str = one_hot_to_seq(adv_xb.squeeze(0))
 
-        analysis_results["pert_in_chunk"].append(delta[:, :, mask_t].abs().mean().item())
-        analysis_results["pert_in_bg"].append(delta[:, :, ~mask_t].abs().mean().item())
-        
-        gc_channels = [to_ix['G'], to_ix['C']]
-        at_channels = [to_ix['A'], to_ix['T']]
-        analysis_results["gc_pert_sum"].append(delta[:, gc_channels, :].sum().item())
-        analysis_results["at_pert_sum"].append(delta[:, at_channels, :].sum().item())
+        flipped_indices = [i for i, (c1, c2) in enumerate(zip(original_seq_str, adv_seq_str)) if c1 != c2]
 
-    # Generate a 2x2 boxplot for the collected metrics
-    fig, axs = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle(f'Distribution of FGSM Perturbation Effects (eps={eps})', fontsize=16)
+        if len(flipped_indices) > 1:
+            sorted_indices = np.sort(flipped_indices)
+            distances = np.diff(sorted_indices)
+            all_flip_distances.extend(distances)
 
-    # Plot 1: Mean Perturbation Magnitude
-    axs[0, 0].boxplot([analysis_results["pert_in_chunk"], analysis_results["pert_in_bg"]], 
-                    labels=['Causal Chunk', 'Background'])
-    axs[0, 0].set_title('Mean Perturbation Magnitude (L1 norm)')
-    axs[0, 0].set_ylabel('Mean |Δ|')
-    axs[0, 0].grid(True, linestyle='--', alpha=0.7)
+        for flip_idx in flipped_indices:
+            loc = 'chunk' if mask[flip_idx] else 'bg'
+            old_base, new_base = original_seq_str[flip_idx], adv_seq_str[flip_idx]
+            old_is_gc, new_is_gc = old_base in gc_bases, new_base in gc_bases
 
-    # Plot 2: Net Perturbation on GC vs AT
-    axs[0, 1].boxplot([analysis_results["gc_pert_sum"], analysis_results["at_pert_sum"]], 
-                    labels=['GC Channels', 'AT Channels'])
-    axs[0, 1].set_title('Net Sum of Perturbations by Base Type')
-    axs[0, 1].set_ylabel('Sum(Δ)')
-    axs[0, 1].grid(True, linestyle='--', alpha=0.7)
+            if not old_is_gc and new_is_gc:
+                counts[loc]['at_to_gc'] += 1
+            elif old_is_gc and not new_is_gc:
+                counts[loc]['gc_to_at'] += 1
+            elif not old_is_gc and not new_is_gc:
+                counts[loc]['at_to_at'] += 1
+            elif old_is_gc and new_is_gc:
+                counts[loc]['gc_to_gc'] += 1
+
+    # --- New stacked bar plot for HotFlip analysis ---
+    total_flips = sum(sum(d.values()) for d in counts.values())
+    if total_flips == 0:
+        print("No flips were made during adversarial generation, skipping plot.")
+        return
+
+    labels = ['In Causal Chunk', 'In Background']
+    data = {
+        'AT → GC': [counts['chunk']['at_to_gc'], counts['bg']['at_to_gc']],
+        'GC → AT': [counts['chunk']['gc_to_at'], counts['bg']['gc_to_at']],
+        'AT → AT': [counts['chunk']['at_to_at'], counts['bg']['at_to_at']],
+        'GC → GC': [counts['chunk']['gc_to_gc'], counts['bg']['gc_to_gc']],
+    }
     
-    # Plot 3 & 4: Histograms for finer detail
-    axs[1, 0].hist(analysis_results["pert_in_bg"], bins=50, alpha=0.75, color='cornflowerblue')
-    axs[1, 0].set_title('Distribution of Mean Perturbation in Background')
-    axs[1, 0].set_xlabel('Mean |Δ| in Background')
-    axs[1, 0].set_ylabel('Frequency')
-    axs[1, 0].grid(True, linestyle='--', alpha=0.7)
+    total_chunk_flips = sum(counts['chunk'].values())
+    total_bg_flips = sum(counts['bg'].values())
+    
+    labels = [f'In Causal Chunk\n(N={total_chunk_flips})', 
+              f'In Background\n(N={total_bg_flips})']
 
-    axs[1, 1].hist(analysis_results["gc_pert_sum"], bins=50, alpha=0.75, color='salmon')
-    axs[1, 1].axvline(0, color='black', linestyle='--', lw=1.5)
-    axs[1, 1].set_title('Distribution of Net Perturbation on GC Channels')
-    axs[1, 1].set_xlabel('Sum of Perturbations (GC Channels)')
-    axs[1, 1].set_ylabel('Frequency')
-    axs[1, 1].grid(True, linestyle='--', alpha=0.7)
+    percentages = {key: [0.0, 0.0] for key in data}
+    if total_chunk_flips > 0:
+        for key in data:
+            percentages[key][0] = 100 * data[key][0] / total_chunk_flips
+    if total_bg_flips > 0:
+        for key in data:
+            percentages[key][1] = 100 * data[key][1] / total_bg_flips
+            
+    fig, ax = plt.subplots(figsize=(10, 7))
+    bottom = np.zeros(len(labels))
+    colors = {'AT → GC': '#2ca02c', 'GC → AT': '#d62728', 'AT → AT': '#1f77b4', 'GC → GC': '#ff7f0e'}
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig("adversarial_perturbation_analysis_seed1.png")
-    print("\nSaved plot → adversarial_perturbation_analysis_seed1.png")
+    for flip_type, values in percentages.items():
+        p = ax.bar(labels, values, width=0.5, bottom=bottom, label=flip_type, color=colors[flip_type])
+        raw_counts = data[flip_type]
+        for i, (p_val, r_count) in enumerate(zip(values, raw_counts)):
+            if p_val > 4:  # Add text only if segment is large enough
+                y_pos = bottom[i] + p_val / 2
+                ax.text(i, y_pos, str(r_count), ha='center', va='center', color='white', fontsize=10, fontweight='bold')
+        bottom += values
+
+    ax.set_ylabel('Percentage of Flips within Location (%)')
+    ax.set_title(f'Composition of HotFlip Attacks (k={k_flips}, Total Flips: {total_flips})')
+    ax.legend(title='Flip Type', bbox_to_anchor=(1.04, 1), loc='upper left')
+    ax.set_ylim(0, 105)
+    ax.grid(True, linestyle='--', alpha=0.6, axis='y')
+
+    plt.tight_layout(rect=[0, 0, 0.85, 0.95])
+    plt.savefig("hotflip_attack_composition.png")
+    print("\nSaved plot → hotflip_attack_composition.png")
+
+    if all_flip_distances:
+        fig_dist, ax_dist = plt.subplots(figsize=(10, 6))
+        neighborhood_size = 20  # From generate_hotflip_examples default
+        ax_dist.hist(all_flip_distances, bins=50, range=(0, 200), label=f'Distances (k={k_flips})')
+        ax_dist.axvline(neighborhood_size, color='r', linestyle='--', 
+                        label=f'Neighborhood Penalty ({neighborhood_size} bp)')
+        ax_dist.set_title('Distribution of Distances Between Consecutive Flips')
+        ax_dist.set_xlabel('Distance (bp)')
+        ax_dist.set_ylabel('Frequency')
+        ax_dist.legend()
+        ax_dist.grid(True, linestyle='--', alpha=0.6)
+        plt.tight_layout()
+        plt.savefig("hotflip_flip_distances.png")
+        print("Saved plot → hotflip_flip_distances.png")
 
 
 # --------------------------------------------------------------------------- #
@@ -499,9 +654,20 @@ def run_single_experiment(seed: int, epsilons_to_test: List[float], train_ds, te
         set_seeds(seed)
         mdl = TinyCNN().to(dev)
         opt = torch.optim.Adam(mdl.parameters(), lr=1e-3)
-        train_robust(mdl, train_dl, bce, opt, dev, eps=eps, epochs=10)
+        
+        # Use fraction of flips `eps` to calculate `k_flips`
+        if eps == 0: # Handle eps=0 case if it occurs
+            print("Skipping HotFlip for eps=0, copying standard model results.")
+            robust_wious.append(std_wiou)
+            robust_accs.append(std_acc)
+            robust_aucs.append(std_auc)
+            continue
+            
+        train_hotflip(mdl, train_dl, bce, opt, dev, flip_fraction=eps, epochs=10)
+        
+        k_flips_for_name = int(eps * SEQ_LEN)
         wio, acc, auc = evaluate_model(mdl,
-                                  f"robust_eps{eps}_seed{seed}",
+                                  f"robust_k{k_flips_for_name}_seed{seed}",
                                   test_ds,
                                   dev,
                                   produce_plots=False)
@@ -546,27 +712,28 @@ if __name__ == "__main__":
     )
 
     print("--- single baseline run for visualisation ---")
-    set_seeds(1)
+    set_seeds(0)
     viz_model = TinyCNN().to(device)
     viz_opt = torch.optim.Adam(viz_model.parameters(), lr=1e-3)
     viz_train_dl = DataLoader(main_train_ds, batch_size=64, shuffle=True)
 
-    train_standard(viz_model, viz_train_dl, bce, viz_opt, device)
+    train_standard_verbose(viz_model, viz_train_dl, bce, viz_opt, device)
     evaluate_model(viz_model, "standard_baseline", main_test_ds, device, True)
     # evaluate_model_gradcam(viz_model, "standard_baseline", main_test_ds, device, True)
     
     # --- Adversarial Analysis Section ---
-    print("\n--- Training a single FGSM model for analysis ---")
-    set_seeds(1)
-    fgsm_model_for_analysis = TinyCNN().to(device)
-    fgsm_opt = torch.optim.Adam(fgsm_model_for_analysis.parameters(), lr=1e-3)
-    train_robust(fgsm_model_for_analysis, viz_train_dl, bce, fgsm_opt, device, eps=0.01)
-    analyze_adversarial_examples(fgsm_model_for_analysis, main_test_ds, device, bce, eps=0.01)
+    print("\n--- Training a single HotFlip model for analysis ---")
+    set_seeds(0)
+    hotflip_model_for_analysis = TinyCNN().to(device)
+    hotflip_opt = torch.optim.Adam(hotflip_model_for_analysis.parameters(), lr=1e-3)
+    
+    analysis_flip_fraction = 0.0025 # Using 1% flips (k=10) for better distance visualization
+    train_hotflip_verbose(hotflip_model_for_analysis, viz_train_dl, bce, hotflip_opt, device, flip_fraction=analysis_flip_fraction)
+    analyze_adversarial_examples(hotflip_model_for_analysis, main_test_ds, device, bce, flip_fraction=analysis_flip_fraction)
+    evaluate_model(hotflip_model_for_analysis, "hotflip_baseline", main_test_ds, device, True)
 
     print("\n--- baseline plots generated. multi-seed experiments start ---\n")
 
-    SEEDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-    EPSILONS = [0.001, 0.0025, 0.005, 0.01, 0.1]
     all_std_wious, all_std_accs, all_std_aucs = [], [], []
     all_rob_wious, all_rob_accs, all_rob_aucs = [], [], []
 
@@ -611,9 +778,9 @@ if __name__ == "__main__":
                      std_wiou_mean + std_wiou_std,
                      color='r', alpha=0.1)
     plt.xscale('log')
-    plt.xlabel('Epsilon')
+    plt.xlabel('Epsilon (Fraction of Sequence Flipped)')
     plt.ylabel('Mean wIoU')
-    plt.title('Epsilon vs interpretability (5 seeds)')
+    plt.title('Epsilon vs interpretability (10 seeds)')
     plt.grid(True, which='both', ls='--')
     plt.legend()
     plt.savefig("multi_seed_fgsm_vs_wiou.png")
@@ -631,9 +798,9 @@ if __name__ == "__main__":
                      std_acc_mean + std_acc_std,
                      color='r', alpha=0.1)
     plt.xscale('log')
-    plt.xlabel('Epsilon')
+    plt.xlabel('Epsilon (Fraction of Sequence Flipped)')
     plt.ylabel('Accuracy')
-    plt.title('Epsilon vs accuracy (5 seeds)')
+    plt.title('Epsilon vs accuracy (10 seeds)')
     plt.grid(True, which='both', ls='--')
     plt.legend()
     plt.savefig("multi_seed_fgsm_vs_acc.png")
@@ -646,9 +813,9 @@ if __name__ == "__main__":
     plt.axhline(std_auc_mean, color='r', ls='--', label=f'Standard mean ({std_auc_mean:.3f})')
     plt.fill_between(EPSILONS, std_auc_mean - std_auc_std, std_auc_mean + std_auc_std, color='r', alpha=0.1)
     plt.xscale('log')
-    plt.xlabel('Epsilon')
+    plt.xlabel('Epsilon (Fraction of Sequence Flipped)')
     plt.ylabel('Mean Saliency AUC')
-    plt.title('Epsilon vs Saliency AUC (5 seeds)')
+    plt.title('Epsilon vs Saliency AUC (10 seeds)')
     plt.grid(True, which='both', ls='--')
     plt.legend()
     plt.savefig("multi_seed_fgsm_vs_saliency_auc.png")
