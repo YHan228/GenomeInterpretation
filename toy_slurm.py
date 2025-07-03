@@ -19,8 +19,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from captum.attr import IntegratedGradients, LayerGradCam
+from captum.attr import IntegratedGradients
 from torch.utils.data import DataLoader, Dataset, random_split
+from torch.cuda.amp import autocast, GradScaler
+import glob
+import pandas as pd
 
 
 # --------------------------------------------------------------------------- //
@@ -174,16 +177,18 @@ class TinyCNN(nn.Module):
 # 4. Training and Evaluation
 # --------------------------------------------------------------------------- #
 
-def train_standard(model, loader, loss_fn, optimizer, dev, epochs: int = 10) -> None:
+def train_standard(model, loader, loss_fn, optimizer, dev, scaler, epochs: int = 10) -> None:
     print("Starting standard training...")
     for epoch in range(epochs):
         model.train()
         for xb, yb, _ in loader:
             xb, yb = xb.to(dev), yb.to(dev)
             optimizer.zero_grad()
-            loss = loss_fn(model(xb), yb)
-            loss.backward()
-            optimizer.step()
+            with autocast():
+                loss = loss_fn(model(xb), yb)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         print(f"  Epoch {epoch + 1}/{epochs} completed.")
 
 def generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction: float, 
@@ -196,8 +201,9 @@ def generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction: float,
     for _ in range(k_flips):
         adv_xb.requires_grad = True
         model.zero_grad()
-        logits = model(adv_xb)
-        loss = loss_fn(logits, yb)
+        with autocast():
+            logits = model(adv_xb)
+            loss = loss_fn(logits, yb)
         loss.backward()
         grad = adv_xb.grad.data
         current_bases_onehot = (adv_xb > 0.5).float()
@@ -222,7 +228,7 @@ def generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction: float,
             forbidden_regions |= newly_forbidden
     return adv_xb
 
-def train_hotflip(model, loader, loss_fn, optimizer, dev,
+def train_hotflip(model, loader, loss_fn, optimizer, dev, scaler,
                   flip_fraction: float, epochs: int = 10) -> None:
     print(f"Starting HotFlip training with flip_fraction = {flip_fraction:.4f} ...")
     for epoch in range(epochs):
@@ -231,10 +237,12 @@ def train_hotflip(model, loader, loss_fn, optimizer, dev,
             xb, yb = xb.to(dev), yb.to(dev)
             adv_xb = generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction)
             optimizer.zero_grad()
-            logits_adv = model(adv_xb)
-            loss_adv = loss_fn(logits_adv, yb)
-            loss_adv.backward()
-            optimizer.step()
+            with autocast():
+                logits_adv = model(adv_xb)
+                loss_adv = loss_fn(logits_adv, yb)
+            scaler.scale(loss_adv).backward()
+            scaler.step(optimizer)
+            scaler.update()
         print(f"  Epoch {epoch + 1}/{epochs} completed.")
 
 def evaluate_model(model, test_dl, dev):
@@ -247,7 +255,8 @@ def evaluate_model(model, test_dl, dev):
     with torch.no_grad():
         for xb, yb, _ in test_dl:
             xb, yb = xb.to(dev), yb.to(dev)
-            logits = model(xb)
+            with autocast():
+                logits = model(xb)
             preds = (torch.sigmoid(logits) > 0.5).float()
             correct += (preds == yb).sum().item()
             total += len(yb)
@@ -255,7 +264,8 @@ def evaluate_model(model, test_dl, dev):
     print(f"  Test accuracy: {accuracy:.3f}")
 
     def model_for_captum(x):
-        return model(x).unsqueeze(-1)
+        with autocast():
+            return model(x).unsqueeze(-1)
 
     ig = IntegratedGradients(model_for_captum)
     test_ds = test_dl.dataset
@@ -308,16 +318,17 @@ def run_single_experiment(seed: int, epsilons_to_test: List[float], main_ds):
         [int(0.8 * N_TOTAL), N_TOTAL - int(0.8 * N_TOTAL)],
         generator=torch.Generator().manual_seed(seed) # Use seed for split
     )
-    train_dl = DataLoader(train_ds, batch_size=64, shuffle=True)
-    test_dl = DataLoader(test_ds, batch_size=128)
+    train_dl = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=4, pin_memory=True)
+    test_dl = DataLoader(test_ds, batch_size=128, num_workers=4, pin_memory=True)
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     bce = nn.BCEWithLogitsLoss()
+    scaler = GradScaler()
 
     set_seeds(seed)
     standard_model = TinyCNN().to(dev)
     opt_standard = torch.optim.Adam(standard_model.parameters(), lr=1e-3)
-    train_standard(standard_model, train_dl, bce, opt_standard, dev)
+    train_standard(standard_model, train_dl, bce, opt_standard, dev, scaler)
     std_wiou, std_acc, std_auc = evaluate_model(standard_model, test_dl, dev)
 
     robust_wious, robust_accs, robust_aucs = [], [], []
@@ -326,7 +337,7 @@ def run_single_experiment(seed: int, epsilons_to_test: List[float], main_ds):
         mdl = TinyCNN().to(dev)
         opt = torch.optim.Adam(mdl.parameters(), lr=1e-3)
         if eps > 0:
-            train_hotflip(mdl, train_dl, bce, opt, dev, flip_fraction=eps, epochs=10)
+            train_hotflip(mdl, train_dl, bce, opt, dev, scaler, flip_fraction=eps, epochs=10)
             wio, acc, auc = evaluate_model(mdl, test_dl, dev)
             robust_wious.append(wio); robust_accs.append(acc); robust_aucs.append(auc)
         else: # Handle eps=0 case
@@ -433,4 +444,76 @@ if __name__ == "__main__":
             plt.savefig(os.path.join(run_output_dir, "delta_performance_vs_epsilon.png"))
             print(f"Saved plot to {os.path.join(run_output_dir, 'delta_performance_vs_epsilon.png')}")
             
-            plt.close('all') # Close all figures to free memory for the next loop 
+            plt.close('all') # Close all figures to free memory for the next loop
+
+    # --- Final Aggregation Across All Runs ---
+    print("\n\nAll hyperparameter experiments finished. Aggregating results...")
+    
+    all_results_files = glob.glob(os.path.join(args.output_dir, '**/multi_seed_results.npz'), recursive=True)
+    
+    if not all_results_files:
+        print("No result files found to aggregate. Exiting.")
+        return
+
+    summary_data = []
+    for f_path in all_results_files:
+        data = np.load(f_path)
+        
+        # Calculate mean improvement (delta) for wIoU and Saliency AUC
+        delta_wiou = np.array(data['rob_wious']) - np.array(data['std_wious'])[:, np.newaxis]
+        delta_sauc = np.array(data['rob_aucs']) - np.array(data['std_aucs'])[:, np.newaxis]
+        
+        mean_delta_wiou = delta_wiou.mean(axis=0)
+        mean_delta_sauc = delta_sauc.mean(axis=0)
+
+        # Find the epsilon that gives the maximum improvement for each metric
+        best_idx_wiou = np.argmax(mean_delta_wiou)
+        best_idx_sauc = np.argmax(mean_delta_sauc)
+
+        summary_data.append({
+            'gc_pos': data['gc_pos'],
+            'conservation': data['conservation'],
+            'max_wiou_improvement': mean_delta_wiou[best_idx_wiou],
+            'best_epsilon_for_wiou': data['epsilons'][best_idx_wiou],
+            'max_sauc_improvement': mean_delta_sauc[best_idx_sauc],
+            'best_epsilon_for_sauc': data['epsilons'][best_idx_sauc],
+        })
+
+    df = pd.DataFrame(summary_data)
+    csv_path = os.path.join(args.output_dir, 'aggregated_summary_results.csv')
+    df.to_csv(csv_path, index=False)
+    print(f"Saved aggregated summary table to {csv_path}")
+
+    # --- Create Summary Heatmap ---
+    try:
+        df_pivot = df.pivot(index='conservation', columns='gc_pos', values='max_wiou_improvement')
+        
+        fig, ax = plt.subplots(figsize=(10, 8))
+        im = ax.imshow(df_pivot.values, cmap='viridis', aspect='auto')
+        
+        # Set ticks and labels
+        ax.set_xticks(np.arange(len(df_pivot.columns)))
+        ax.set_yticks(np.arange(len(df_pivot.index)))
+        ax.set_xticklabels(df_pivot.columns.to_numpy().round(2))
+        ax.set_yticklabels(df_pivot.index.to_numpy().round(2))
+        
+        ax.set_xlabel("GC Content (Positive Class)")
+        ax.set_ylabel("Conservation")
+        ax.set_title("Max Mean ΔwIoU Improvement vs. Hyperparameters")
+        
+        # Add text annotations
+        for i in range(len(df_pivot.index)):
+            for j in range(len(df_pivot.columns)):
+                text = ax.text(j, i, f"{df_pivot.values[i, j]:.3f}",
+                               ha="center", va="center", color="w")
+
+        fig.colorbar(im, ax=ax, label="Max Mean ΔwIoU")
+        plt.tight_layout()
+        
+        heatmap_path = os.path.join(args.output_dir, 'summary_heatmap_wiou.png')
+        plt.savefig(heatmap_path)
+        print(f"Saved summary heatmap to {heatmap_path}")
+        
+    except Exception as e:
+        print(f"Could not generate heatmap. Error: {e}")
+        print("This can happen if you only run one hyperparameter combination.") 
