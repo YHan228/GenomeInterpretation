@@ -31,28 +31,29 @@ b. Adversarial Attack (HotFlip-style):
      3. The single best flip (i.e., the position and new base that most
         increases the loss) is identified.
      4. The sequence is modified with this single flip.
-     5. This process is repeated for *k* iterations, where *k* is a fraction
-        (`epsilon`) of the sequence length. This iterative design creates
+     5. This process is repeated for *k* iterations, where *k* is the number of
+        nucleotides to flip (k = epsilon * sequence length). This iterative design creates
         progressively more challenging adversarial examples.
-   - The model is then trained on this final, "attacked" batch, which
-     encourages it to learn robust, causal features over brittle confounders.
-
+   - The model is then trained on this final, "attacked" batch.
+   
 c. Interpretability Metrics:
-   - After training, we evaluate the models using Integrated Gradients to
-     generate attribution maps, which tell us how important each nucleotide was
-     for a given prediction.
-   - We then quantify the quality of these attributions using three metrics:
+   - We use Integrated Gradients with an all-zero baseline to generate
+     attribution maps for each sequence. The quality of these maps is
+     quantified using three metrics (all ranging from 0 to 1, except SNR):
      1. wIoU (weighted Intersection-over-Union): Measures how well the
-        attribution map *locates* the true causal motif. A score of 1.0 means
-        the attributions are perfectly concentrated on the true 60-bp motif.
+        attribution map *locates* the true causal motif. It is calculated as
+        the sum of attribution scores inside the true motif divided by the sum
+        of scores in the union of the true motif and the predicted region
+        (defined as the 60bp window with the highest total attribution). A
+        score of 1 indicates a perfect match.
      2. SaliencyAUC: Measures the *purity* of attributions. It is the
         probability that a randomly chosen position inside the motif has a
         higher attribution score than a randomly chosen position outside. A
-        score of 1.0 means all attributions are correctly inside the motif.
+        score of 1 means all attributions are correctly concentrated within
+        the motif.
      3. SaliencySNR (Signal-to-Noise Ratio): Measures the *sharpness* of
         attributions. It is the ratio of the mean attribution score inside the
-        motif to the mean score outside. A higher value means the model is more
-        "confident" in its attributions.
+        motif to the mean score outside. Its range is 0 to infinity.
 
 d. Model Architecture (TinyCNN):
    - A simple, 3-layer convolutional neural network (CNN) is used for the
