@@ -1235,7 +1235,7 @@ if __name__ == "__main__":
         else:
             print("  - Skipping Plot Set 2: No data for scheduled models found.")
 
-        # --- PLOT SET 3: Summary Bar Chart ---
+        # --- PLOT SET 3: Summary Bar Chart of Mean Improvements ---
         print("\n--- Generating Plot Set 3: Summary Bar Chart of Mean Improvements ---")
         if was_lambda_sweep and 'best_lambdas' in locals():
             print("Using best-lambda data for summary chart.")
@@ -1279,7 +1279,6 @@ if __name__ == "__main__":
                 sharey=False,
                 palette='viridis',
                 col_order=['Adversarial', 'Adversarial+Regu'],
-                legend=False # Disable automatic legend creation
             )
             y_label_text = "Mean Improvement vs. Standard"
             g.set_axis_labels("GC Content (Confounder Strength)", y_label_text)
@@ -1304,7 +1303,7 @@ if __name__ == "__main__":
                 if i % g.axes.shape[1] != 0:
                     ax.set_ylabel("")
 
-            g.add_legend(title="Conservation", loc='upper center', bbox_to_anchor=(.5, 0.98), ncol=3, frameon=False)
+            sns.move_legend(g, "upper center", bbox_to_anchor=(.5, 0.98), ncol=3, title="Conservation", frameon=False)
             g.tight_layout(rect=[0, 0, 1, 0.93])
             overview_path = os.path.join(plots_dir, "summary_barchart_mean_improvement.png")
             g.savefig(overview_path, dpi=150)
@@ -1312,6 +1311,63 @@ if __name__ == "__main__":
             print(f"  Saved final summary plot to {overview_path}")
         else:
             print("  - Skipping Plot Set 3: No adversarial data with best lambda to calculate improvements.")
+
+        # --- PLOT SET 4: Scheduled vs Non-scheduled adversarial models (no regularization) ---
+        print("\n--- Generating Plot Set 4: Scheduled vs Non-scheduled (No Regularization) ---")
+        df_no_regu = df[df['regularization'] == 'no_regu'].copy()
+
+        if not df_no_regu.empty and df_no_regu[df_no_regu['epsilon'] > 0].shape[0] > 0:
+            # Calculate deltas relative to the standard model within each scheduling mode
+            baseline_for_bar = df_no_regu[
+                df_no_regu['epsilon'] == 0
+            ].set_index(
+                ['scheduling_mode', 'gc_pos', 'conservation', 'seed']
+            )[metrics_to_plot].rename(columns=lambda c: f"{c}_base")
+
+            df_for_barchart = df_no_regu[df_no_regu['epsilon'] > 0].join(
+                baseline_for_bar, on=['scheduling_mode', 'gc_pos', 'conservation', 'seed']
+            )
+
+            delta_df_list = []
+            for metric in metrics_to_plot:
+                delta_col = f'delta_{metric}'
+                df_for_barchart[delta_col] = df_for_barchart[metric] - df_for_barchart.get(f'{metric}_base', 0)
+                temp_df = df_for_barchart[['scheduling_mode', 'gc_pos', 'conservation', delta_col]].copy()
+                temp_df.rename(columns={delta_col: 'delta_value'}, inplace=True)
+                temp_df['metric'] = metric.replace('Saliency', '')
+                delta_df_list.append(temp_df)
+            
+            final_delta_df = pd.concat(delta_df_list, ignore_index=True)
+
+            g = sns.catplot(
+                data=final_delta_df,
+                x='gc_pos', y='delta_value', hue='conservation',
+                col='scheduling_mode', row='metric',
+                kind='bar', height=3, aspect=2.2,
+                sharey=False,
+                palette='viridis',
+                col_order=['no_schedule', 'scheduled'],
+            )
+            y_label_text = "Mean Improvement vs. Standard"
+            g.set_axis_labels("GC Content (Confounder Strength)", y_label_text)
+            g.set_titles(col_template="{col_name}", row_template="{row_name}", fontweight='bold')
+            g.fig.suptitle("Mean Improvement: Scheduled vs. Non-Scheduled Adversarial Training (No Regularization)", y=1.03)
+            
+            # Customize axes
+            for i, ax in enumerate(g.axes.flat):
+                ax.axhline(0, ls='--', color='gray', zorder=0)
+                if i % g.axes.shape[1] != 0:
+                    ax.set_ylabel("")
+
+            sns.move_legend(g, "upper center", bbox_to_anchor=(.5, 0.98), ncol=3, title="Conservation", frameon=False)
+            g.tight_layout(rect=[0, 0, 1, 0.93])
+            overview_path = os.path.join(plots_dir, "summary_barchart_sched_vs_nonsched.png")
+            g.savefig(overview_path, dpi=150)
+            plt.close(g.fig)
+            print(f"  Saved scheduled vs non-scheduled summary plot to {overview_path}")
+        else:
+            print("  - Skipping Plot Set 4: No data for non-regularized adversarial models found.")
+
 
         sys.exit(0)
 
