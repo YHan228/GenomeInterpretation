@@ -98,6 +98,7 @@ WITH_CONFOUNDER = True # Global switch for GC-content difference
 # --- Hyperparameter Search Space ---
 GC_HPARAMS = [0.525, 0.535, 0.55, 0.575, 0.6, 0.625, 0.65]
 CONS_HPARAMS = [0.6, 0.7, 0.8]
+LAMBDAS_HPARAMS = [1e-3, 1e-2, 0.1, 1.0] # Lambda values to sweep
 # ---
 
 SEEDS = [0, 1, 2, 3, 4]
@@ -273,10 +274,10 @@ class TinyCNN(nn.Module):
     def forward(self, x):
         x = F.relu(self.conv1(x)); x = F.max_pool1d(x, 2)
         x = F.relu(self.conv2(x)); x = F.max_pool1d(x, 2)
-        x = F.relu(self.conv3(x)); x = F.max_pool1d(x, 2)
+        conv3_out = F.relu(self.conv3(x)); x = F.max_pool1d(conv3_out, 2)
         x = self.pool(x).squeeze(-1)
         logits = self.fc(x)
-        return logits.squeeze(-1)
+        return logits.squeeze(-1), conv3_out
 
 
 # --------------------------------------------------------------------------- #
@@ -317,15 +318,17 @@ def validate_epoch(model, loader, loss_fn, dev):
         for xb, yb, _ in loader:
             xb, yb = xb.to(dev), yb.to(dev)
             with autocast():
-                logits = model(xb)
+                logits, _ = model(xb)
                 loss = loss_fn(logits, yb)
             total_loss += loss.item()
             num_batches += 1
     return total_loss / num_batches if num_batches > 0 else 0
 
 
-def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, writer, scheduler, early_stopper, epochs: int = 10) -> None:
-    print("Starting standard training...")
+def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, writer, scheduler, early_stopper, epochs: int = 10, lambda_l1: float = 0.0) -> None:
+    reg_str = f"with L1 reg (λ={lambda_l1:.2E})" if lambda_l1 > 0 else ""
+    print(f"Starting standard training {reg_str}...")
+
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
@@ -334,7 +337,14 @@ def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, sca
             xb, yb = xb.to(dev), yb.to(dev)
             optimizer.zero_grad()
             with autocast():
-                loss = loss_fn(model(xb), yb)
+                logits, conv_out = model(xb)
+                class_loss = loss_fn(logits, yb)
+                if lambda_l1 > 0:
+                    l1_penalty = conv_out.abs().mean()
+                    loss = class_loss + (lambda_l1 * l1_penalty)
+                else:
+                    loss = class_loss
+
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -366,7 +376,7 @@ def generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction: float,
         adv_xb.requires_grad = True
         model.zero_grad()
         with autocast():
-            logits = model(adv_xb)
+            logits, _ = model(adv_xb)
             loss = loss_fn(logits, yb)
         loss.backward()
         grad = adv_xb.grad.data
@@ -393,10 +403,11 @@ def generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction: float,
     return adv_xb
 
 def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, writer, scheduler, early_stopper,
-                  max_flip_fraction: float, epochs: int = 10, use_scheduling: bool = True) -> None:
+                  max_flip_fraction: float, epochs: int = 10, use_scheduling: bool = True, lambda_l1: float = 0.0) -> None:
     
     scheduling_str = "ON" if use_scheduling else "OFF"
-    print(f"Starting HotFlip training with max_flip_fraction = {max_flip_fraction:.4f}, Scheduling: {scheduling_str}...")
+    reg_str = f"with L1 reg (λ={lambda_l1:.2E})" if lambda_l1 > 0 else ""
+    print(f"Starting HotFlip training with max_flip_fraction = {max_flip_fraction:.4f}, Scheduling: {scheduling_str} {reg_str}...")
     
     for epoch in range(epochs):
         
@@ -418,8 +429,14 @@ def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scal
             adv_xb = generate_hotflip_examples(model, xb, yb, loss_fn, current_flip_fraction)
             optimizer.zero_grad()
             with autocast():
-                logits_adv = model(adv_xb)
-                loss_adv = loss_fn(logits_adv, yb)
+                logits_adv, conv_out_adv = model(adv_xb)
+                class_loss = loss_fn(logits_adv, yb)
+                if lambda_l1 > 0:
+                    l1_penalty = conv_out_adv.abs().mean()
+                    loss_adv = class_loss + (lambda_l1 * l1_penalty)
+                else:
+                    loss_adv = class_loss
+
             scaler.scale(loss_adv).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -452,7 +469,7 @@ def evaluate_model(model, test_dl, dev):
         for xb, yb, _ in test_dl:
             xb, yb = xb.to(dev), yb.to(dev)
             with autocast():
-                logits = model(xb)
+                logits, _ = model(xb)
             preds = (torch.sigmoid(logits) > 0.5).float()
             correct += (preds == yb).sum().item()
             total += len(yb)
@@ -461,7 +478,7 @@ def evaluate_model(model, test_dl, dev):
 
     def model_for_captum(x):
         with autocast():
-            return model(x).unsqueeze(-1)
+            return model(x)[0].unsqueeze(-1)
 
     ig = IntegratedGradients(model_for_captum)
     test_ds = test_dl.dataset
@@ -478,11 +495,12 @@ def evaluate_model(model, test_dl, dev):
         
     idxs = rng.choice(positive_subset_indices, size=sample_n_actual, replace=False)
 
+    baseline = torch.full((1, 4, SEQ_LEN), 0.25, device=dev)
     results = []
     for idx in idxs:
         xb, _, mask = test_ds[idx]
         xb = xb.unsqueeze(0).to(dev)
-        attributions = ig.attribute(xb, target=0).abs().sum(1).squeeze(0).cpu().numpy()
+        attributions = ig.attribute(xb, baselines=baseline, target=0).abs().sum(1).squeeze(0).cpu().numpy()
         window_sums = np.convolve(attributions, np.ones(ANALYSIS_CHUNK_LEN), mode='valid')
         best_window_start = np.argmax(window_sums)
         pred_mask_cont = np.zeros(SEQ_LEN, dtype=bool)
@@ -514,8 +532,8 @@ def evaluate_model(model, test_dl, dev):
 # 5. Experiment Runner
 # --------------------------------------------------------------------------- #
 
-def run_single_experiment(seed: int, epsilons_to_test: List[float], main_ds, tb_run_dir: str, npz_run_dir: str, epochs: int, use_scheduling: bool):
-    print(f"\n{'=' * 20}  SEED {seed}  {'=' * 20}")
+def run_single_experiment(seed: int, epsilons_to_test: List[float], main_ds, tb_run_dir: str, npz_run_dir: str, epochs: int, use_scheduling: bool, use_regularization: bool, lambda_l1: float):
+    print(f"\n{'=' * 20}  SEED {seed} | Schedule: {use_scheduling} | Regu: {use_regularization} | λ: {lambda_l1:.2E}  {'=' * 20}")
     
     # Create main training and test splits
     train_val_ds, test_ds = random_split(
@@ -582,10 +600,10 @@ def run_single_experiment(seed: int, epsilons_to_test: List[float], main_ds, tb_
     std_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_standard, T_max=epochs)
     std_early_stopper = EarlyStopping(patience=5, verbose=True)
 
-    train_standard(standard_model, train_dl, val_dl, bce, opt_standard, dev, scaler, std_writer, std_scheduler, std_early_stopper, epochs=epochs)
+    train_standard(standard_model, train_dl, val_dl, bce, opt_standard, dev, scaler, std_writer, std_scheduler, std_early_stopper, epochs=epochs, lambda_l1=lambda_l1)
     std_wiou, std_acc, std_auc, std_snr = evaluate_model(standard_model, test_dl, dev)
     std_writer.add_hparams(
-        {'model': 'standard', 'epsilon': 0, 'seed': seed},
+        {'model': 'standard', 'epsilon': 0, 'seed': seed, 'regularized': use_regularization, 'lambda': lambda_l1},
         {'hparam/accuracy': std_acc, 'hparam/wIoU': std_wiou, 'hparam/saliency_auc': std_auc, 'hparam/saliency_snr': std_snr}
     )
     std_writer.close()
@@ -606,16 +624,16 @@ def run_single_experiment(seed: int, epsilons_to_test: List[float], main_ds, tb_
         
         if eps > 0:
             train_hotflip(mdl, train_dl, val_dl, bce, opt, dev, scaler, rob_writer, rob_scheduler, rob_early_stopper, 
-                          max_flip_fraction=eps, epochs=epochs, use_scheduling=use_scheduling)
+                          max_flip_fraction=eps, epochs=epochs, use_scheduling=use_scheduling, lambda_l1=lambda_l1)
             wio, acc, auc, snr = evaluate_model(mdl, test_dl, dev)
             rob_writer.add_hparams(
-                {'model': 'robust', 'epsilon': eps, 'seed': seed},
+                {'model': 'robust', 'epsilon': eps, 'seed': seed, 'regularized': use_regularization, 'lambda': lambda_l1},
                 {'hparam/accuracy': acc, 'hparam/wIoU': wio, 'hparam/saliency_auc': auc, 'hparam/saliency_snr': snr}
             )
             robust_wious.append(wio); robust_accs.append(acc); robust_aucs.append(auc); robust_snrs.append(snr)
         else: # Handle eps=0 case
             rob_writer.add_hparams(
-                {'model': 'standard', 'epsilon': 0, 'seed': seed},
+                {'model': 'standard', 'epsilon': 0, 'seed': seed, 'regularized': use_regularization, 'lambda': lambda_l1},
                 {'hparam/accuracy': std_acc, 'hparam/wIoU': std_wiou, 'hparam/saliency_auc': std_auc, 'hparam/saliency_snr': std_snr}
             )
             robust_wious.append(std_wiou); robust_accs.append(std_acc); robust_aucs.append(std_auc); robust_snrs.append(std_snr)
@@ -670,7 +688,7 @@ def main(args):
 
                 for sd in SEEDS:
                     sw, sa, sa_auc, s_snr, rw, ra, ra_auc, r_snr = run_single_experiment(
-                        sd, EPSILONS, main_dataset, run_output_dir, run_output_dir, args.epochs, use_scheduling
+                        sd, EPSILONS, main_dataset, run_output_dir, run_output_dir, args.epochs, use_scheduling, False, 0.0
                     )
                     all_std_wious.append(sw); all_std_accs.append(sa); all_std_aucs.append(sa_auc); all_std_snrs.append(s_snr)
                     all_rob_wious.append(rw); all_rob_accs.append(ra); all_rob_aucs.append(ra_auc); all_rob_snrs.append(r_snr)
@@ -706,29 +724,60 @@ def main(args):
 def main_single_combo(args, array_idx: int):
     """Run experiments for a single combination determined by array_idx."""
 
-    # Build mapping list once
-    combos = []
+    # Build mapping lists for each experimental mode
+    # Mode adv_vs_std: runs schedule=True/False with regularized=False (42 jobs)
+    adv_vs_std_combos = []
     for schedule in [True, False]:
         for gc_val in GC_HPARAMS:
             for cons_val in CONS_HPARAMS:
-                combos.append((schedule, gc_val, cons_val))
+                adv_vs_std_combos.append({'schedule': schedule, 'regularized': False, 'gc': gc_val, 'cons': cons_val, 'lambda': 0.0})
 
-    if array_idx < 0 or array_idx >= len(combos):
+    # Mode regu_comp: runs schedule=True with regularized=True/False (42 jobs for baseline + 3*42 for lambda sweep)
+    regu_comp_combos = []
+    # Add non-regularized baselines for the regu comparison
+    for gc_val in GC_HPARAMS:
+        for cons_val in CONS_HPARAMS:
+            regu_comp_combos.append({'schedule': True, 'regularized': False, 'gc': gc_val, 'cons': cons_val, 'lambda': 0.0})
+    # Add regularized sweeps
+    for l1 in LAMBDAS_HPARAMS:
+        for gc_val in GC_HPARAMS:
+            for cons_val in CONS_HPARAMS:
+                regu_comp_combos.append({'schedule': True, 'regularized': True, 'gc': gc_val, 'cons': cons_val, 'lambda': l1})
+    
+    # Mode all: all unique experiments
+    all_combos = adv_vs_std_combos + [c for c in regu_comp_combos if c['regularized']]
+
+
+    # Select the right set of experiments based on the mode
+    if args.experiment_mode == 'adv_vs_std':
+        combos = adv_vs_std_combos
+    elif args.experiment_mode == 'regu_comp':
+        combos = regu_comp_combos
+    else:  # 'all'
+        combos = all_combos
+    
+    num_jobs = len(combos)
+    if array_idx < 0 or array_idx >= num_jobs:
         raise ValueError(
-            f"array_idx {array_idx} is out of range (0-{len(combos) - 1})")
+            f"array_idx {array_idx} is out of range for mode '{args.experiment_mode}' (0-{num_jobs - 1})")
 
-    use_scheduling, gc_hparam, cons_hparam = combos[array_idx]
+    combo = combos[array_idx]
+    use_scheduling, use_regularization, gc_hparam, cons_hparam, lambda_l1 = \
+        combo['schedule'], combo['regularized'], combo['gc'], combo['cons'], combo['lambda']
 
     schedule_mode_str = "scheduled" if use_scheduling else "no_schedule"
+    regu_mode_str = "regularized" if use_regularization else "no_regu"
     
     # Define distinct output paths for tensorboard and npz files
-    tb_run_dir = os.path.join(args.output_dir, "tensorboard", schedule_mode_str, f"gc_{gc_hparam:.3f}_cons_{cons_hparam:.2f}")
-    npz_run_dir = os.path.join(args.output_dir, "npz_results", schedule_mode_str, f"gc_{gc_hparam:.3f}_cons_{cons_hparam:.2f}")
+    # Add lambda to path for regularized runs to avoid overwriting
+    lambda_str = f"_lambda_{lambda_l1:.0E}" if use_regularization else ""
+    tb_run_dir = os.path.join(args.output_dir, "tensorboard", schedule_mode_str, regu_mode_str, f"gc_{gc_hparam:.3f}_cons_{cons_hparam:.2f}{lambda_str}")
+    npz_run_dir = os.path.join(args.output_dir, "npz_results", schedule_mode_str, regu_mode_str, f"gc_{gc_hparam:.3f}_cons_{cons_hparam:.2f}{lambda_str}")
     os.makedirs(tb_run_dir, exist_ok=True)
     os.makedirs(npz_run_dir, exist_ok=True)
 
-    print(f"Running single-combo job: schedule={schedule_mode_str}, "
-          f"GC={gc_hparam:.3f}, CONS={cons_hparam:.2f}")
+    print(f"Running single-combo job: schedule={schedule_mode_str}, regularized={use_regularization}, "
+          f"GC={gc_hparam:.3f}, CONS={cons_hparam:.2f}, LAMBDA={lambda_l1:.2E}")
     print(f"  - Tensorboard logs will be saved to: {tb_run_dir}")
     print(f"  - NPZ results will be saved to: {npz_run_dir}")
 
@@ -751,6 +800,8 @@ def main_single_combo(args, array_idx: int):
             npz_run_dir, # Pass the specific npz directory
             args.epochs,
             use_scheduling,
+            use_regularization,
+            lambda_l1
         )
         all_std_wious.append(sw)
         all_std_accs.append(sa)
@@ -768,6 +819,9 @@ def main_single_combo(args, array_idx: int):
         seeds=SEEDS,
         gc_pos=gc_hparam,
         conservation=cons_hparam,
+        scheduling=use_scheduling,
+        regularization=use_regularization,
+        lambda_l1=lambda_l1,
         std_wious=all_std_wious,
         std_accs=all_std_accs,
         std_aucs=all_std_aucs,
@@ -823,6 +877,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip training entirely and only generate plots from existing npz results.",
     )
+    parser.add_argument(
+        "--experiment_mode",
+        type=str,
+        default="all",
+        choices=['all', 'adv_vs_std', 'regu_comp'],
+        help="Which set of experiments to run: 'adv_vs_std' or 'regu_comp'.",
+    )
 
     args = parser.parse_args()
 
@@ -842,7 +903,17 @@ if __name__ == "__main__":
         os.makedirs(plots_dir, exist_ok=True)
 
         # --- Scan and plot per-combo ---
-        npz_path = os.path.join(args.output_dir, "npz_results")
+        # Allow user to point to either the run directory or the npz_results directory directly
+        if os.path.basename(args.output_dir.rstrip('/\\')) == 'npz_results':
+            npz_path = args.output_dir
+        else:
+            npz_path = os.path.join(args.output_dir, "npz_results")
+        
+        if not os.path.isdir(npz_path):
+            print(f"Error: The results directory '{npz_path}' could not be found.")
+            print(f"Please provide the correct path to the SLURM run directory (e.g., slurm_results/run_...). You provided: '{args.output_dir}'")
+            sys.exit(1)
+
         npz_files = glob.glob(os.path.join(npz_path, '**', 'multi_seed_results.npz'), recursive=True)
         if not npz_files:
             print(f"No .npz result files found in {npz_path}; nothing to aggregate.")
@@ -853,11 +924,19 @@ if __name__ == "__main__":
         all_data = []
         for f_path in npz_files:
             try:
-                data = np.load(f_path)
-                # Extract HPs from path or data
-                scheduling_mode = "scheduled" if "scheduled" in f_path else "no_schedule"
-                gc_pos = float(data['gc_pos'])
-                cons = float(data['conservation'])
+                data = np.load(f_path, allow_pickle=True)
+                
+                # Extract HPs from data, using .item() to get scalar from 0-d array
+                # Default to checking path for backward compatibility with older results
+                is_scheduled = data['scheduling'].item() if 'scheduling' in data else 'scheduled' in f_path
+                is_regularized = data['regularization'].item() if 'regularization' in data else 'regularized' in f_path
+
+                scheduling_mode = "scheduled" if is_scheduled else "no_schedule"
+                regularization_mode = "regularized" if is_regularized else "no_regu"
+
+                gc_pos = float(data['gc_pos'].item())
+                cons = float(data['conservation'].item())
+                lambda_val = float(data['lambda_l1'].item()) if 'lambda_l1' in data else (1e-3 if is_regularized else 0.0)
                 
                 seeds = data['seeds']
                 epsilons = data['epsilons']
@@ -877,7 +956,8 @@ if __name__ == "__main__":
                 for i, seed in enumerate(seeds):
                     # Add standard model data (epsilon = 0)
                     all_data.append({
-                        'scheduling_mode': scheduling_mode, 'gc_pos': gc_pos, 'conservation': cons,
+                        'scheduling_mode': scheduling_mode, 'regularization': regularization_mode, 
+                        'gc_pos': gc_pos, 'conservation': cons, 'lambda': lambda_val,
                         'seed': seed, 'epsilon': 0, 'wIoU': std_wious[i], 'Accuracy': std_accs[i],
                         'SaliencyAUC': std_aucs[i], 'SaliencySNR': std_snrs[i],
                     })
@@ -885,7 +965,8 @@ if __name__ == "__main__":
                     for j, eps in enumerate(epsilons):
                         # Add robust model data
                         all_data.append({
-                            'scheduling_mode': scheduling_mode, 'gc_pos': gc_pos, 'conservation': cons,
+                            'scheduling_mode': scheduling_mode, 'regularization': regularization_mode,
+                            'gc_pos': gc_pos, 'conservation': cons, 'lambda': lambda_val,
                             'seed': seed, 'epsilon': eps, 'wIoU': rob_wious[i, j], 'Accuracy': rob_accs[i, j],
                             'SaliencyAUC': rob_aucs[i, j], 'SaliencySNR': rob_snrs[i, j],
                         })
@@ -897,125 +978,340 @@ if __name__ == "__main__":
         df.to_csv(master_csv_path, index=False)
         print(f"Saved master data table to {master_csv_path}")
 
-        print("Generating summary distribution plots...")
-        metrics = ['wIoU', 'Accuracy', 'SaliencyAUC', 'SaliencySNR']
-        
-        # --- Create Delta Plots ---
-        print("Calculating delta metrics for focused plots...")
-        baseline_metrics = df[df['epsilon'] == 0].set_index(
-            ['scheduling_mode', 'gc_pos', 'conservation', 'seed']
-        )[metrics].rename(columns=lambda c: f"{c}_base")
-        
-        df_merged = df.join(baseline_metrics, on=['scheduling_mode', 'gc_pos', 'conservation', 'seed'])
-        
-        for metric in metrics:
-            df_merged[f'delta_{metric}'] = df_merged[metric] - df_merged[f'{metric}_base']
-            
-        df_deltas = df_merged[df_merged['epsilon'] > 0].copy()
-        
-        # --- Create Detailed Box Plots ---
-        print("Generating detailed distribution plots...")
+        def get_model_type(row):
+            is_adv = row['epsilon'] > 0
+            is_reg = row['regularization'] == 'regularized'
+            if is_adv and is_reg: return 'Adversarial+Regu'
+            if is_adv and not is_reg: return 'Adversarial'
+            if not is_adv and is_reg: return 'Standard+Regu'
+            if not is_adv and not is_reg: return 'Standard'
+
+        df['model_type'] = df.apply(get_model_type, axis=1)
+
         metrics_to_plot = ['wIoU', 'Accuracy', 'SaliencyAUC', 'SaliencySNR']
         
-        baseline_stats = df_merged.groupby(['scheduling_mode', 'gc_pos'])[[f'{m}_base' for m in metrics_to_plot]].agg(['mean', 'sem'])
+        # --- PLOT SET 1: Standard vs Adversarial (scheduled vs non-scheduled) ---
+        print("\n--- Generating Plot Set 1: Standard vs Adversarial ---")
+        df_adv_comp = df[df['regularization'] == 'no_regu'].copy()
 
-        for metric in metrics_to_plot:
-            delta_metric = f'delta_{metric}'
-            base_metric = f'{metric}_base'
-            print(f"  - Plotting {delta_metric} distributions...")
-
-            is_snr = delta_metric == 'delta_SaliencySNR'
+        if not df_adv_comp.empty:
+            baseline_metrics = df_adv_comp[df_adv_comp['epsilon'] == 0].set_index(
+                ['scheduling_mode', 'gc_pos', 'conservation', 'seed']
+            )[metrics_to_plot].rename(columns=lambda c: f"{c}_base")
             
-            g = sns.catplot(
-                data=df_deltas,
-                x="epsilon", y=delta_metric, hue="conservation",
-                col="scheduling_mode", row="gc_pos",
-                kind="box", height=2.5, aspect=2.2,
-                palette='viridis', legend_out=True,
-                fliersize=2.5,
-                linewidth=1.0,
-                sharey=False,
-                showfliers=True
-            )
-            g.set_axis_labels("Epsilon", f"Improvement ({delta_metric})")
-            g.fig.suptitle(f"Improvement in {metric} vs. Adversarial Epsilon", y=0.98, fontsize=16)
+            df_adv_comp = df_adv_comp.join(baseline_metrics, on=['scheduling_mode', 'gc_pos', 'conservation', 'seed'])
+            
+            for metric in metrics_to_plot:
+                df_adv_comp[f'delta_{metric}'] = df_adv_comp[metric] - df_adv_comp[f'{metric}_base']
+                
+            df_deltas = df_adv_comp[df_adv_comp['epsilon'] > 0].copy()
 
-            mid_row_idx = g.axes.shape[0] // 2
-            for i, ax in enumerate(g.axes[:, 0]):
-                if i != mid_row_idx:
+            # Get baseline stats for titles
+            baseline_df = df_adv_comp[df_adv_comp['epsilon'] == 0].copy()
+
+            for metric in metrics_to_plot:
+                if df_deltas.empty:
+                    print(f"  - Skipping delta plot for {metric}: no adversarial data found.")
+                    continue
+                delta_metric = f'delta_{metric}'
+                print(f"  - Plotting {delta_metric} distributions...")
+                
+                g = sns.catplot(
+                    data=df_deltas, x="epsilon", y=delta_metric, hue="conservation",
+                    col="scheduling_mode", row="gc_pos",
+                    kind="box", height=3, aspect=2, palette='viridis',
+                    fliersize=2, linewidth=1.0, sharey=False, showfliers=True,
+                    col_order=['no_schedule', 'scheduled']
+                )
+                
+                y_label_text = f"Improvement ({metric})"
+                g.set_axis_labels("Epsilon", y_label_text)
+                g.set_titles(col_template="{col_name}", row_template="GC = {row_name}")
+                g.fig.suptitle(f"Improvement in {metric}: Standard vs Adversarial Training", y=1.03)
+                
+                # Get baseline stats for this metric to add to titles
+                baseline_stats = baseline_df.groupby(['gc_pos', 'scheduling_mode'])[metric].agg(['mean', 'std']).reset_index()
+
+                # Customize titles to include baseline metric levels
+                for i, ax_row in enumerate(g.axes):
+                    for j, ax in enumerate(ax_row):
+                        gc_val = g.row_names[i]
+                        sched_val = g.col_names[j]
+                        
+                        stats = baseline_stats[
+                            (baseline_stats['gc_pos'] == gc_val) & 
+                            (baseline_stats['scheduling_mode'] == sched_val)
+                        ]
+                        
+                        title = f"GC: {gc_val} | {sched_val}"
+                        if not stats.empty:
+                            mean_val = stats['mean'].iloc[0]
+                            std_val = stats['std'].iloc[0]
+                            title += f"\n(Baseline {metric} ≈ {mean_val:.2f} ± {std_val:.2f})"
+                        
+                        ax.set_title(title, fontweight='bold', fontsize=9)
+                        ax.axhline(0, ls='--', color='red', zorder=0)
+                        ax.tick_params(axis='x', rotation=45)
+                        
+                        if j > 0:
+                            ax.set_ylabel("")
+
+                sns.move_legend(g, "upper center", bbox_to_anchor=(.5, 0.98), ncol=3, title="Conservation", frameon=False)
+                g.tight_layout(rect=[0, 0, 1, 0.93])
+                plot_path = os.path.join(plots_dir, f"adv_comp_boxplot_{delta_metric}.png")
+                g.savefig(plot_path, dpi=150)
+                plt.close(g.fig)
+                print(f"    Saved to {plot_path}")
+        else:
+            print("  - Skipping Plot Set 1: No data for non-regularized models found.")
+
+
+        # --- PLOT SET 2: 3-Way Delta-Performance Comparison (Scheduled Only) ---
+        print("\n--- Generating Plot Set 2: 3-Way Delta-Performance Comparison (Scheduled Only) ---")
+        df_scheduled = df[df['scheduling_mode'] == 'scheduled'].copy()
+        
+        if not df_scheduled.empty:
+            df_std_regu = df_scheduled[df_scheduled['model_type'] == 'Standard+Regu'].copy()
+
+            # Check if a lambda sweep was actually performed.
+            was_lambda_sweep = False
+            if not df_std_regu.empty:
+                if df_std_regu['lambda'].nunique() > 1:
+                    was_lambda_sweep = True
+
+            if was_lambda_sweep:
+                print("Lambda sweep data detected. Generating 3-Way Delta Plot with best lambda.")
+                # To find the best lambda, we must first calculate the delta_wIoU for the Standard+Regu models
+                baseline_for_delta = df_scheduled[
+                    df_scheduled['model_type'] == 'Standard'
+                ].set_index(
+                    ['gc_pos', 'conservation', 'seed']
+                )[['wIoU']].rename(columns={'wIoU': 'wIoU_base'})
+
+                df_std_regu_delta = df_std_regu.join(baseline_for_delta, on=['gc_pos', 'conservation', 'seed'])
+                df_std_regu_delta['delta_wIoU'] = df_std_regu_delta['wIoU'] - df_std_regu_delta.get('wIoU_base', 0)
+
+                # Now, find the lambda that gives the highest mean delta_wIoU for each gc_pos group
+                best_lambdas_df = df_std_regu_delta.groupby(
+                    ['gc_pos', 'lambda']
+                )['delta_wIoU'].mean().reset_index()
+                
+                best_lambdas_idx = best_lambdas_df.groupby(['gc_pos'])['delta_wIoU'].idxmax()
+                best_lambdas = best_lambdas_df.loc[best_lambdas_idx][['gc_pos', 'lambda']]
+                best_lambdas.rename(columns={'lambda': 'best_lambda'}, inplace=True)
+                
+                print("\n--- Best Lambdas selected (by mean delta-wIoU) ---")
+                print(best_lambdas)
+                print("-" * 50)
+                
+                # Merge this best_lambda back into the main scheduled df
+                df_scheduled = df_scheduled.merge(best_lambdas, on=['gc_pos'], how='left')
+                df_scheduled = df_scheduled.assign(best_lambda=df_scheduled['best_lambda'].fillna(0))
+
+                # Now, filter to the data needed for the plots
+                df_regu_best = df_scheduled[
+                    (df_scheduled['regularization'] == 'regularized') &
+                    (df_scheduled['lambda'] == df_scheduled['best_lambda'])
+                ].copy()
+                df_no_regu = df_scheduled[df_scheduled['regularization'] == 'no_regu'].copy()
+                df_for_plotting = pd.concat([df_regu_best, df_no_regu])
+
+                # Get the baseline and calculate deltas
+                baseline = df_for_plotting[
+                    (df_for_plotting['model_type'] == 'Standard')
+                ].set_index(
+                    ['gc_pos', 'conservation', 'seed']
+                )[metrics_to_plot].rename(columns=lambda c: f"{c}_base")
+                df_for_plotting = df_for_plotting.join(baseline, on=['gc_pos', 'conservation', 'seed'])
+                for metric in metrics_to_plot:
+                    df_for_plotting[f'delta_{metric}'] = df_for_plotting[metric] - df_for_plotting.get(f'{metric}_base', 0)
+                
+                # Prepare the final dataframe for plotting by filtering out the standard model
+                df_plot_final = df_for_plotting[df_for_plotting['model_type'] != 'Standard'].copy()
+
+                # Prepare the separate dataframe for the Standard+Regu plot (x-axis is lambda)
+                df_regu_plot = df_std_regu.join(baseline, on=['gc_pos', 'conservation', 'seed'])
+                for metric in metrics_to_plot:
+                    df_regu_plot[f'delta_{metric}'] = df_regu_plot[metric] - df_regu_plot.get(f'{metric}_base', 0)
+                # Ensure lambda_str is present for plotting
+                df_regu_plot['lambda_str'] = df_regu_plot['lambda'].apply(lambda x: f"{x:.0e}")
+                # Ensure lambda_str is sorted by numeric lambda, not string order
+                lambda_order = [f"{x:.0e}" for x in sorted(df_regu_plot['lambda'].unique())]
+
+                for metric in metrics_to_plot:
+                    delta_metric = f'delta_{metric}'
+                    print(f"  - Plotting {delta_metric} 3-way comparison boxplot...")
+                    
+                    g = sns.FacetGrid(
+                        df_plot_final, col="model_type", row="gc_pos",
+                        col_order=['Standard+Regu', 'Adversarial', 'Adversarial+Regu'],
+                        sharex=False, sharey=False, height=3.5, aspect=1.2, margin_titles=True
+                    )
+
+                    # --- FINAL, CORRECT FIX: Draw plots axis by axis to avoid all bugs ---
+                    for (row_val, col_val), ax in g.axes_dict.items():
+                        if col_val == 'Standard+Regu':
+                            sns.boxplot(
+                                data=df_regu_plot[df_regu_plot['gc_pos'] == row_val],
+                                x='lambda_str', y=delta_metric, hue='conservation', ax=ax,
+                                order=lambda_order,
+                                fliersize=1.5, linewidth=1.0, palette='viridis'
+                            )
+                            # Rotate tick labels slightly for readability.
+                            ax.tick_params(axis='x', rotation=45)
+                        else:
+                            sns.boxplot(
+                                data=df_plot_final[(df_plot_final['gc_pos'] == row_val) & (df_plot_final['model_type'] == col_val)],
+                                x='epsilon', y=delta_metric, hue='conservation', ax=ax,
+                                fliersize=1.5, linewidth=1.0, palette='viridis'
+                            )
+                        
+                        # Remove all individual legends to avoid duplication
+                        if ax.get_legend() is not None:
+                            ax.get_legend().remove()
+                    
+                    g.set_axis_labels("Epsilon", f"Improvement in {metric} (vs. Standard)")
+                    g.set_titles(col_template="{col_name}", row_template="GC = {row_name}", fontweight='bold')
+                    g.fig.suptitle(f"3-Way Model Comparison: Improvement in {metric} (Scheduled Training, Best λ by wIoU)", y=1.03)
+
+                    for i, ((row_val, col_val), ax) in enumerate(g.axes_dict.items()):
+                        ax.set_title(ax.get_title(), fontweight='bold')
+                        if col_val == 'Standard+Regu':
+                            ax.set_xlabel('λ (L1 penalty)')
+                        else:
+                            ax.set_xlabel('Epsilon')
+                        ax.axhline(0, ls='--', color='red', zorder=0)
+                        if i % g.axes.shape[1] != 0: ax.set_ylabel("")
+                        ax.grid(True, linestyle='--', alpha=0.5)
+                        ax.tick_params(axis='x', rotation=45)
+                    
+                    # Create a custom legend manually
+                    from matplotlib.patches import Patch
+                    from matplotlib.lines import Line2D
+                    
+                    # Get unique conservation values and their colors
+                    conservation_values = sorted(df_plot_final['conservation'].unique())
+                    colors = plt.cm.viridis(np.linspace(0, 1, len(conservation_values)))
+                    
+                    # Create legend handles
+                    legend_elements = [Patch(facecolor=colors[i], label=f'{val}') 
+                                     for i, val in enumerate(conservation_values)]
+                    
+                    # Add legend to the figure
+                    g.fig.legend(handles=legend_elements, loc='upper center', 
+                               bbox_to_anchor=(0.5, 0.98), ncol=3, title="Conservation", frameon=False)
+                    g.tight_layout(rect=[0, 0, 1, 0.93])
+                    plot_path = os.path.join(plots_dir, f"3way_delta_comp_boxplot_{delta_metric}.png")
+                    g.savefig(plot_path, dpi=150)
+                    plt.close(g.fig)
+                    print(f"    Saved to {plot_path}")
+
+            else:
+                print("No lambda sweep data found. Generating fallback 4-Way Performance Plot.")
+                for metric in metrics_to_plot:
+                    print(f"  - Plotting {metric} 4-way performance boxplot...")
+                    g = sns.catplot(
+                        data=df_scheduled, x='epsilon', y=metric,
+                        hue='conservation', col='model_type', row='gc_pos',
+                        kind='box', height=3.5, aspect=1.2,
+                        col_order=['Standard', 'Standard+Regu', 'Adversarial', 'Adversarial+Regu'],
+                        sharey=False, fliersize=1.5, linewidth=1.0, palette='viridis'
+                    )
+                    g.set_axis_labels("Epsilon", f"Performance ({metric})")
+                    g.set_titles(col_template="{col_name}", row_template="GC = {row_name}", fontweight='bold')
+                    g.fig.suptitle(f"4-Way Model Comparison ({metric}, Scheduled Training)", y=1.03)
+
+                    for i, ax in enumerate(g.axes.flat):
+                        ax.grid(True, linestyle='--', alpha=0.5)
+                        ax.tick_params(axis='x', rotation=45)
+                        if i > 0: ax.set_ylabel("")
+
+                    sns.move_legend(g, "upper center", bbox_to_anchor=(.5, 0.98), ncol=3, title="Conservation", frameon=False)
+                    g.tight_layout(rect=[0, 0, 1, 0.93])
+                    plot_path = os.path.join(plots_dir, f"4way_fallback_perf_boxplot_{metric}.png")
+                    g.savefig(plot_path, dpi=150)
+                    plt.close(g.fig)
+                    print(f"    Saved to {plot_path}")
+        else:
+            print("  - Skipping Plot Set 2: No data for scheduled models found.")
+
+        # --- PLOT SET 3: Summary Bar Chart ---
+        print("\n--- Generating Plot Set 3: Summary Bar Chart of Mean Improvements ---")
+        if was_lambda_sweep and 'best_lambdas' in locals():
+            print("Using best-lambda data for summary chart.")
+            # Reuse the 'best_lambda' logic from plot set 2
+            df_for_barchart_base = df[df['scheduling_mode'] == 'scheduled'].copy()
+            df_for_barchart = df_for_barchart_base.merge(best_lambdas, on=['gc_pos'], how='left')
+            df_for_barchart['best_lambda'] = df_for_barchart['best_lambda'].fillna(0)
+            
+            # Filter to only include adversarial runs with the best lambda
+            df_adv_no_regu = df_for_barchart[df_for_barchart['model_type'] == 'Adversarial']
+            df_adv_best_regu = df_for_barchart[
+                (df_for_barchart['model_type'] == 'Adversarial+Regu') &
+                (df_for_barchart['lambda'] == df_for_barchart['best_lambda'])
+            ]
+            df_for_barchart = pd.concat([df_adv_no_regu, df_adv_best_regu])
+
+            # Calculate deltas relative to the standard model
+            baseline_for_bar = df[
+                (df['model_type'] == 'Standard') & (df['scheduling_mode'] == 'scheduled')
+            ].set_index(
+                ['gc_pos', 'conservation', 'seed']
+            )[metrics_to_plot].rename(columns=lambda c: f"{c}_base")
+            df_for_barchart = df_for_barchart.join(baseline_for_bar, on=['gc_pos', 'conservation', 'seed'])
+
+            delta_df_list = []
+            for metric in metrics_to_plot:
+                delta_col = f'delta_{metric}'
+                df_for_barchart[delta_col] = df_for_barchart[metric] - df_for_barchart.get(f'{metric}_base', 0)
+                temp_df = df_for_barchart[['model_type', 'gc_pos', 'conservation', delta_col]].copy()
+                temp_df.rename(columns={delta_col: 'delta_value'}, inplace=True)
+                temp_df['metric'] = metric.replace('Saliency', '')
+                delta_df_list.append(temp_df)
+            
+            final_delta_df = pd.concat(delta_df_list, ignore_index=True)
+
+            g = sns.catplot(
+                data=final_delta_df,
+                x='gc_pos', y='delta_value', hue='conservation',
+                col='model_type', row='metric',
+                kind='bar', height=3, aspect=2.2,
+                sharey=False,
+                palette='viridis',
+                col_order=['Adversarial', 'Adversarial+Regu'],
+                legend=False # Disable automatic legend creation
+            )
+            y_label_text = "Mean Improvement vs. Standard"
+            g.set_axis_labels("GC Content (Confounder Strength)", y_label_text)
+            
+            # Add best lambda info to titles
+            for (row_val, col_val), ax in g.axes_dict.items():
+                title = f"{row_val} | {col_val}"
+                if col_val == 'Adversarial+Regu':
+                    try:
+                        # Find the gc values in the axis title to locate the best lambda
+                        best_lambda_val = best_lambdas.loc[best_lambdas['gc_pos'] == row_val]['best_lambda'].values[0]
+                        title += f' (Best λ={best_lambda_val:.0E})'
+                    except (IndexError, ValueError):
+                        pass # In case GC parsing fails
+                ax.set_title(title, fontweight='bold')
+
+            g.fig.suptitle("Mean Interpretability Improvement from Adversarial Training", y=1.03)
+            
+            # Customize axes
+            for i, ax in enumerate(g.axes.flat):
+                ax.axhline(0, ls='--', color='gray', zorder=0)
+                if i % g.axes.shape[1] != 0:
                     ax.set_ylabel("")
 
-            for (gc, mode), ax in g.axes_dict.items():
-                ax.axhline(0, ls='--', color='red', zorder=0)
-                ax.tick_params(axis='x', labelrotation=45)
-                
-                mean_val = baseline_stats.loc[(mode, gc)][(f'{base_metric}', 'mean')]
-                sem_val = baseline_stats.loc[(mode, gc)][(f'{base_metric}', 'sem')]
-                ax.set_title(f"GC: {gc} | {mode}\n(Baseline {metric} ≈ {mean_val:.2f} ± {sem_val:.2f})", fontsize=10)
-                
-                ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=6, prune='both'))
-
-                if is_snr:
-                    ax.set_yscale('symlog', linthresh=1.0)
-                    ax.yaxis.set_major_formatter(ticker.ScalarFormatter())
-
-            g.fig.tight_layout(rect=[0, 0, 1, 0.93])
-            sns.move_legend(g, "lower center", bbox_to_anchor=(.5, 0.93), ncol=3, title="Conservation", frameon=False)
-            
-            plot_path = os.path.join(plots_dir, f"summary_boxplot_{delta_metric}.png")
-            g.savefig(plot_path, dpi=150)
+            g.add_legend(title="Conservation", loc='upper center', bbox_to_anchor=(.5, 0.98), ncol=3, frameon=False)
+            g.tight_layout(rect=[0, 0, 1, 0.93])
+            overview_path = os.path.join(plots_dir, "summary_barchart_mean_improvement.png")
+            g.savefig(overview_path, dpi=150)
             plt.close(g.fig)
-            print(f"    Saved to {plot_path}")
-
-        # --- Create Final Summary Bar Chart ---
-        print("\nCreating final summary bar chart...")
-        
-        # Melt the dataframe to get a 'metric' column
-        df_long = df_deltas.melt(
-            id_vars=['scheduling_mode', 'gc_pos', 'conservation', 'epsilon', 'seed'],
-            value_vars=[f'delta_{m}' for m in metrics],
-            var_name='metric',
-            value_name='delta_value'
-        )
-
-        # Calculate the mean improvement across all epsilons > 0
-        mean_improvement_df = df_long.groupby(
-            ['scheduling_mode', 'gc_pos', 'conservation', 'metric'],
-            as_index=False
-        )['delta_value'].mean()
-        
-        mean_improvement_df['metric'] = mean_improvement_df['metric'].str.replace('delta_', 'Δ')
-        
-        g = sns.catplot(
-            data=mean_improvement_df,
-            x='gc_pos',
-            y='delta_value',
-            hue='conservation',
-            col='scheduling_mode',
-            row='metric',
-            kind='bar',
-            height=3,
-            aspect=2.5,
-            legend_out=True,
-            sharey=False, 
-            palette='viridis'
-        )
-        
-        g.set_axis_labels("GC Content (Confounder Strength)", "Mean Improvement")
-        g.set_titles(row_template="{row_name}", col_template="{col_name}")
-        g.fig.suptitle("Mean Interpretability Improvement from Adversarial Training", y=1.03, fontsize=16)
-
-        for ax in g.axes.flat:
-            ax.axhline(0, ls='--', color='gray', zorder=0)
-
-        sns.move_legend(g, "upper right", bbox_to_anchor=(0.95, 0.9), title="Conservation")
-        
-        g.fig.tight_layout(rect=[0, 0, 1, 0.96])
-        
-        overview_path = os.path.join(plots_dir, "summary_barchart_mean_improvement.png")
-        g.savefig(overview_path, dpi=150)
-        plt.close(g.fig)
-        print(f"Saved final summary plot to {overview_path}")
+            print(f"  Saved final summary plot to {overview_path}")
+        else:
+            print("  - Skipping Plot Set 3: No adversarial data with best lambda to calculate improvements.")
 
         sys.exit(0)
 

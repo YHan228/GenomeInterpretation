@@ -49,3 +49,6 @@ __pycache__/
 
 # any folder named tensorboard
 tensorboard/
+
+# temporary paper
+wang22e.pdf
