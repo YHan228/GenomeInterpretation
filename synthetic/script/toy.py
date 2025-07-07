@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from captum.attr import IntegratedGradients, LayerGradCam
 from torch.utils.data import DataLoader, Dataset, random_split
+from torch.cuda.amp import autocast, GradScaler
 
 
 # --------------------------------------------------------------------------- //
@@ -103,7 +104,7 @@ POS_N = N_TOTAL // 2
 NEG_N = N_TOTAL - POS_N
 
 # Define GC content based on the global flag
-GC_POS = 0.60 if WITH_CONFOUNDER else 0.50
+GC_POS = 0.55 if WITH_CONFOUNDER else 0.50
 GC_NEG = 0.50
 
 X, y, masks = [], [], []
@@ -169,10 +170,10 @@ class TinyCNN(nn.Module):
     def forward(self, x):
         x = F.relu(self.conv1(x)); x = F.max_pool1d(x, 2)
         x = F.relu(self.conv2(x)); x = F.max_pool1d(x, 2)
-        x = F.relu(self.conv3(x)); x = F.max_pool1d(x, 2)
+        conv3_out = F.relu(self.conv3(x)); x = F.max_pool1d(conv3_out, 2)
         x = self.pool(x).squeeze(-1)
         logits = self.fc(x) # Return raw logits
-        return logits.squeeze(-1)
+        return logits.squeeze(-1), conv3_out
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -185,158 +186,173 @@ bce = nn.BCEWithLogitsLoss()
 # 4. Training functions
 # --------------------------------------------------------------------------- #
 
-def train_standard(model, loader, loss_fn, optimizer, dev, epochs: int = 10) -> None:
-    print("Starting standard training...")
-    for epoch in range(epochs):
-        model.train()
+class EarlyStopping:
+    """Early stops the training if validation loss doesn't improve after a given patience."""
+    def __init__(self, patience=5, verbose=False, delta=0):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.inf
+        self.delta = delta
+
+    def __call__(self, val_loss):
+        score = -val_loss
+        if self.best_score is None:
+            self.best_score = score
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.verbose:
+                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.counter = 0
+
+def validate_epoch(model, loader, loss_fn, dev):
+    """Calculates the loss on a validation set."""
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+    with torch.no_grad():
         for xb, yb, _ in loader:
             xb, yb = xb.to(dev), yb.to(dev)
+            with autocast():
+                logits, _ = model(xb)
+                loss = loss_fn(logits, yb)
+            total_loss += loss.item()
+            num_batches += 1
+    return total_loss / num_batches if num_batches > 0 else 0
+
+
+def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, scheduler, early_stopper, epochs: int = 10, lambda_l1: float = 0.0) -> None:
+    reg_str = f"with L1 reg (λ={lambda_l1:.2E})" if lambda_l1 > 0 else ""
+    print(f"Starting standard training {reg_str}...")
+
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0.0
+        num_batches = 0
+        for xb, yb, _ in train_loader:
+            xb, yb = xb.to(dev), yb.to(dev)
             optimizer.zero_grad()
-            loss = loss_fn(model(xb), yb)
-            loss.backward()
-            optimizer.step()
-        print(f"  Epoch {epoch + 1}/{epochs} completed.")
+            with autocast():
+                logits, conv_out = model(xb)
+                class_loss = loss_fn(logits, yb)
+                if lambda_l1 > 0:
+                    l1_penalty = conv_out.abs().mean()
+                    loss = class_loss + (lambda_l1 * l1_penalty)
+                else:
+                    loss = class_loss
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.item()
+            num_batches += 1
+        
+        avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
+        avg_val_loss = validate_epoch(model, val_loader, loss_fn, dev)
+
+        print(f"  Epoch {epoch + 1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        
+        scheduler.step()
+        early_stopper(avg_val_loss)
+        if early_stopper.early_stop:
+            print("Early stopping triggered.")
+            break
 
 
 def generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction: float, 
                               neighborhood_size: int = 20, penalize_nearby: bool = False):
-    """
-    Generates adversarial examples using iterative, greedy HotFlip.
-    Includes optional penalty for flipping bases in a local neighborhood.
-    """
     seq_len = xb.shape[2]
     k_flips = int(flip_fraction * seq_len)
-
-    if flip_fraction > 0.05:
-        print(f"Warning: HotFlip is changing {k_flips}/{seq_len} ({flip_fraction:.1%}) "
-              f"of bases, which is > 5%. This may be unrealistic.")
-
     adv_xb = xb.clone()
     forbidden_regions = torch.zeros_like(adv_xb[:, 0, :], dtype=torch.bool, device=xb.device)
 
     for _ in range(k_flips):
         adv_xb.requires_grad = True
         model.zero_grad()
-        logits = model(adv_xb)
-        loss = loss_fn(logits, yb)
+        with autocast():
+            logits, _ = model(adv_xb)
+            loss = loss_fn(logits, yb)
         loss.backward()
         grad = adv_xb.grad.data
-
         current_bases_onehot = (adv_xb > 0.5).float()
         grad_at_current_bases = (grad * current_bases_onehot).sum(dim=1, keepdim=True)
         saliency_scores = grad - grad_at_current_bases
         saliency_scores.masked_fill_(current_bases_onehot.bool(), -1e9)
-
         best_flip_scores_per_pos, _ = saliency_scores.max(dim=1)
         if penalize_nearby:
             best_flip_scores_per_pos.masked_fill_(forbidden_regions, -1e9)
-        
         best_pos_to_flip = best_flip_scores_per_pos.argmax(dim=1)
         best_new_base_idx = saliency_scores[range(len(xb)), :, best_pos_to_flip].argmax(dim=1)
-
         old_base_idx = adv_xb[range(len(xb)), :, best_pos_to_flip].argmax(dim=1)
         adv_xb = adv_xb.detach()
         adv_xb[range(len(xb)), old_base_idx, best_pos_to_flip] = 0.0
         adv_xb[range(len(xb)), best_new_base_idx, best_pos_to_flip] = 1.0
-        
         if penalize_nearby:
-            for i in range(len(xb)):
-                pos = best_pos_to_flip[i].item()
-                start = max(0, pos - neighborhood_size)
-                end = min(seq_len, pos + neighborhood_size + 1)
-                forbidden_regions[i, start:end] = True
-
+            pos = best_pos_to_flip
+            start = torch.clamp(pos - neighborhood_size, 0)
+            end = torch.clamp(pos + neighborhood_size + 1, max=seq_len)
+            indices = torch.arange(seq_len, device=xb.device).unsqueeze(0)
+            newly_forbidden = (indices >= start.unsqueeze(1)) & (indices < end.unsqueeze(1))
+            forbidden_regions |= newly_forbidden
     return adv_xb
 
 
-def train_hotflip(model, loader, loss_fn, optimizer, dev,
-                  flip_fraction: float, epochs: int = 10) -> None:
-    print(f"Starting HotFlip training with flip_fraction = {flip_fraction:.4f} ...")
+def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, scheduler, early_stopper,
+                  max_flip_fraction: float, epochs: int = 10, use_scheduling: bool = True, lambda_l1: float = 0.0) -> None:
+    
+    scheduling_str = "ON" if use_scheduling else "OFF"
+    reg_str = f"with L1 reg (λ={lambda_l1:.2E})" if lambda_l1 > 0 else ""
+    print(f"Starting HotFlip training with max_flip_fraction = {max_flip_fraction:.4f}, Scheduling: {scheduling_str} {reg_str}...")
+    
     for epoch in range(epochs):
-        model.train()
-        for xb, yb, _ in loader:
-            xb, yb = xb.to(dev), yb.to(dev)
-
-            # Generate adversarial examples for the batch
-            adv_xb = generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction)
-            
-            optimizer.zero_grad()
-            logits_adv = model(adv_xb)
-            loss_adv = loss_fn(logits_adv, yb)
-            loss_adv.backward()
-            optimizer.step()
-        print(f"  Epoch {epoch + 1}/{epochs} completed.")
-
-
-def train_standard_verbose(model, loader, loss_fn, optimizer, dev, epochs: int = 10) -> None:
-    print("Starting verbose standard training...")
-    for epoch in range(epochs):
-        model.train()
-        running_loss = 0.0
-        correct_preds = 0
-        total_samples = 0
-        num_batches = len(loader)
-        for i, (xb, yb, _) in enumerate(loader):
-            xb, yb = xb.to(dev), yb.to(dev)
-            
-            optimizer.zero_grad()
-            logits = model(xb)
-            loss = loss_fn(logits, yb)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-            preds = (torch.sigmoid(logits) > 0.5).float()
-            correct_preds += (preds == yb).sum().item()
-            total_samples += len(yb)
-            
-            if (i + 1) % 10 == 0:
-                avg_loss = running_loss / 10
-                avg_acc = correct_preds / total_samples
-                print(f"  Epoch {epoch+1}, Batch {i+1}/{num_batches} | "
-                      f"Avg Loss (last 10): {avg_loss:.4f} | "
-                      f"Running Acc: {avg_acc:.4f}")
-                running_loss = 0.0
         
-        epoch_acc = correct_preds / total_samples
-        print(f"  Epoch {epoch + 1}/{epochs} completed. Final Training Accuracy: {epoch_acc:.4f}")
-
-
-def train_hotflip_verbose(model, loader, loss_fn, optimizer, dev,
-                          flip_fraction: float, epochs: int = 10) -> None:
-    print(f"Starting verbose HotFlip training with flip_fraction = {flip_fraction:.4f} ...")
-    for epoch in range(epochs):
+        max_flips = int(max_flip_fraction * SEQ_LEN)
+        
+        if use_scheduling:
+            # Smart scheduling: Linearly ramp up from 1 flip to max_flips.
+            num_flips = 1 + int(np.floor((max_flips - 1) * (epoch / (epochs - 1)))) if epochs > 1 else max_flips
+            current_flip_fraction = num_flips / SEQ_LEN
+        else:
+            current_flip_fraction = max_flip_fraction
+        
         model.train()
-        running_loss = 0.0
-        correct_preds = 0
-        total_samples = 0
-        num_batches = len(loader)
-        for i, (xb, yb, _) in enumerate(loader):
+        total_loss = 0.0
+        num_batches = 0
+        for xb, yb, _ in train_loader:
             xb, yb = xb.to(dev), yb.to(dev)
-
-            adv_xb = generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction)
-            
+            adv_xb = generate_hotflip_examples(model, xb, yb, loss_fn, current_flip_fraction)
             optimizer.zero_grad()
-            logits_adv = model(adv_xb)
-            loss_adv = loss_fn(logits_adv, yb)
-            loss_adv.backward()
-            optimizer.step()
+            with autocast():
+                logits_adv, conv_out_adv = model(adv_xb)
+                class_loss = loss_fn(logits_adv, yb)
+                if lambda_l1 > 0:
+                    l1_penalty = conv_out_adv.abs().mean()
+                    loss_adv = class_loss + (lambda_l1 * l1_penalty)
+                else:
+                    loss_adv = class_loss
 
-            running_loss += loss_adv.item()
-            preds = (torch.sigmoid(logits_adv) > 0.5).float()
-            correct_preds += (preds == yb).sum().item()
-            total_samples += len(yb)
+            scaler.scale(loss_adv).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss_adv.item()
+            num_batches += 1
 
-            if (i + 1) % 10 == 0:
-                avg_loss = running_loss / 10
-                avg_acc = correct_preds / total_samples
-                print(f"  Epoch {epoch+1}, Batch {i+1}/{num_batches} | "
-                      f"Avg Adv Loss (last 10): {avg_loss:.4f} | "
-                      f"Running Adv Acc: {avg_acc:.4f}")
-                running_loss = 0.0
+        avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
+        avg_val_loss = validate_epoch(model, val_loader, loss_fn, dev)
+        
+        print(f"  Epoch {epoch + 1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Epsilon: {current_flip_fraction:.4f}")
 
-        epoch_acc = correct_preds / total_samples
-        print(f"  Epoch {epoch + 1}/{epochs} completed. Final Adversarial Training Accuracy: {epoch_acc:.4f}")
+        scheduler.step()
+        early_stopper(avg_val_loss)
+        if early_stopper.early_stop:
+            print("Early stopping triggered.")
+            break
 
 
 # --------------------------------------------------------------------------- #
@@ -354,7 +370,8 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
     with torch.no_grad():
         for xb, yb, _ in test_dl:
             xb, yb = xb.to(dev), yb.to(dev)
-            logits = model(xb)
+            with autocast():
+                logits, _ = model(xb)
             preds = (torch.sigmoid(logits) > 0.5).float()
             correct += (preds == yb).sum().item()
             total += len(yb)
@@ -363,7 +380,8 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
 
     # -- Integrated Gradients ----------------------------------------------------
     def model_for_captum(x):
-        return model(x).unsqueeze(-1)
+        with autocast():
+            return model(x)[0].unsqueeze(-1)
 
     ig = IntegratedGradients(model_for_captum)
 
@@ -377,16 +395,21 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
     if sample_n_actual < SAMPLE_N:
         print(f"Warning: only {sample_n_actual} positive samples found "
               f"(requested {SAMPLE_N}).")
+    if sample_n_actual == 0:
+        print("Warning: No positive samples in test set for evaluation.")
+        return 0.0, accuracy, 0.0, 0.0
+        
     idxs = rng.choice(positive_subset_indices,
                       size=sample_n_actual,
                       replace=False)
 
+    baseline = torch.full((1, 4, SEQ_LEN), 0.25, device=dev)
     results = []
     for idx in idxs:
         xb, _, mask = test_ds[idx]
         xb = xb.unsqueeze(0).to(dev)
         attributions = (
-            ig.attribute(xb, target=0)
+            ig.attribute(xb, baselines=baseline, target=0)
               .abs()
               .sum(1)
               .squeeze(0)
@@ -413,9 +436,15 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
         # Efficiently calculate AUC: probability that a random inside score is > a random outside score
         saliency_auc = (inside_scores[:, None] > outside_scores[None, :]).mean()
 
+        # 3. Saliency Signal-to-Noise Ratio
+        mean_inside = inside_scores.mean()
+        mean_outside = outside_scores.mean()
+        saliency_snr = mean_inside / (mean_outside + 1e-9)
+
         results.append(
             dict(iou_cont=iou_cont,
                  saliency_auc=saliency_auc,
+                 saliency_snr=saliency_snr,
                  attributions=attributions,
                  mask=mask,
                  cont_start=best_window_start)
@@ -423,17 +452,19 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
 
     if not results:
         print("No positives in sample set – increase SAMPLE_N.")
-        return (0.0, 0.0, 0.0) if not produce_plots else (0.0, accuracy, 0.0)
+        return 0.0, accuracy, 0.0, 0.0
 
     # -- statistics --------------------------------------------------------------
     results.sort(key=lambda r: r['iou_cont'])
     mean_iou_cont = np.mean([r['iou_cont'] for r in results])
     mean_saliency_auc = np.mean([r['saliency_auc'] for r in results])
+    mean_saliency_snr = np.mean([r['saliency_snr'] for r in results])
     print(f"Mean wIoU : {mean_iou_cont:.3f} on {len(results)} positive samples")
     print(f"Mean Saliency AUC: {mean_saliency_auc:.3f}")
+    print(f"Mean Saliency SNR: {mean_saliency_snr:.3f}")
 
     if not produce_plots:
-        return mean_iou_cont, accuracy, mean_saliency_auc
+        return mean_iou_cont, accuracy, mean_saliency_auc, mean_saliency_snr
 
     # -- plotting ----------------------------------------------------------------
     fig, axs = plt.subplots(3, 2, figsize=(15, 12))
@@ -454,7 +485,7 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
                 label='IG score',
                 color='black',
                 linewidth=0.7)
-        ax.set_title(f"{title}\nwIoU={data['iou_cont']:.3f}, AUC={data['saliency_auc']:.3f}")
+        ax.set_title(f"{title}\nwIoU={data['iou_cont']:.3f}, AUC={data['saliency_auc']:.3f}, SNR={data['saliency_snr']:.2f}")
         ax.set_xlabel("Position")
         ax.set_ylabel("IG score")
         ax.grid(True, ls='--', alpha=0.6)
@@ -483,8 +514,9 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
     # -- distribution plots ------------------------------------------------------
     wious = [r['iou_cont'] for r in results]
     saliency_aucs = [r['saliency_auc'] for r in results]
+    saliency_snrs = [r['saliency_snr'] for r in results]
 
-    fig_dist, axs_dist = plt.subplots(1, 2, figsize=(12, 5))
+    fig_dist, axs_dist = plt.subplots(1, 3, figsize=(18, 5))
     fig_dist.suptitle(f'Evaluation Metric Distributions ({model_name.title()})')
 
     axs_dist[0].hist(wious, bins=20, alpha=0.75)
@@ -498,11 +530,16 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
     axs_dist[1].set_xlabel('Score')
     axs_dist[1].grid(True, ls='--', alpha=0.6)
 
+    axs_dist[2].hist(saliency_snrs, bins=20, alpha=0.75, range=(0, max(np.percentile(saliency_snrs, 99), 10)))
+    axs_dist[2].set_title('Saliency SNR')
+    axs_dist[2].set_xlabel('Score')
+    axs_dist[2].grid(True, ls='--', alpha=0.6)
+
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(f"{model_name}_metric_distributions.png")
     print(f"Saved plot → {model_name}_metric_distributions.png")
 
-    return mean_iou_cont, accuracy, mean_saliency_auc
+    return mean_iou_cont, accuracy, mean_saliency_auc, mean_saliency_snr
 
 
 def analyze_adversarial_examples(model, test_ds, dev, loss_fn, flip_fraction: float):
@@ -624,49 +661,63 @@ def analyze_adversarial_examples(model, test_ds, dev, loss_fn, flip_fraction: fl
 # 6. Experiment helpers
 # --------------------------------------------------------------------------- #
 
-def run_single_experiment(seed: int, epsilons_to_test: List[float], train_ds, test_ds):
+def run_single_experiment(seed: int, epsilons_to_test: List[float], main_train_ds, test_ds):
     """
-    1 Generates data for the seed
-    2 Trains a standard model and evaluates wIoU & acc
-    3 Trains robust models for each epsilon, evaluates each
+    1. Generates data for the seed
+    2. Trains a standard model and evaluates wIoU & acc
+    3. Trains robust models for each epsilon, evaluates each
     """
     print(f"\n{'=' * 20}  SEED {seed}  {'=' * 20}")
+    
+    # Create a validation set from the main training data
+    train_size = int(0.9 * len(main_train_ds))
+    val_size = len(main_train_ds) - train_size
+    train_ds, val_ds = random_split(main_train_ds, [train_size, val_size], generator=torch.Generator().manual_seed(seed))
 
-    # Use the provided datasets
-    train_dl = DataLoader(train_ds, batch_size=64, shuffle=True)
+    train_dl = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=4, pin_memory=True)
+    val_dl = DataLoader(val_ds, batch_size=128, num_workers=4, pin_memory=True)
+    
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     bce = nn.BCEWithLogitsLoss()
+    scaler = GradScaler()
+    epochs = 30 # Increased epochs for better convergence with scheduler
 
-    # standard model ------------------------------------------------------------
+    # --- Standard model ---
     set_seeds(seed)
     standard_model = TinyCNN().to(dev)
     opt_standard = torch.optim.Adam(standard_model.parameters(), lr=1e-3)
-    train_standard(standard_model, train_dl, bce, opt_standard, dev)
-    std_wiou, std_acc, std_auc = evaluate_model(standard_model,
+    std_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_standard, T_max=epochs)
+    std_early_stopper = EarlyStopping(patience=5, verbose=True)
+    
+    train_standard(standard_model, train_dl, val_dl, bce, opt_standard, dev, scaler, std_scheduler, std_early_stopper, epochs=epochs)
+    std_wiou, std_acc, std_auc, std_snr = evaluate_model(standard_model,
                                        f"standard_seed{seed}",
                                        test_ds,
                                        dev,
                                        produce_plots=False)
 
-    # robust models -------------------------------------------------------------
-    robust_wious, robust_accs, robust_aucs = [], [], []
+    # --- Robust models ---
+    robust_wious, robust_accs, robust_aucs, robust_snrs = [], [], [], []
     for eps in epsilons_to_test:
         set_seeds(seed)
         mdl = TinyCNN().to(dev)
         opt = torch.optim.Adam(mdl.parameters(), lr=1e-3)
-        
-        # Use fraction of flips `eps` to calculate `k_flips`
-        if eps == 0: # Handle eps=0 case if it occurs
+        rob_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+        rob_early_stopper = EarlyStopping(patience=5, verbose=True)
+
+        if eps == 0:
             print("Skipping HotFlip for eps=0, copying standard model results.")
             robust_wious.append(std_wiou)
             robust_accs.append(std_acc)
             robust_aucs.append(std_auc)
+            robust_snrs.append(std_snr)
             continue
             
-        train_hotflip(mdl, train_dl, bce, opt, dev, flip_fraction=eps, epochs=10)
+        train_hotflip(mdl, train_dl, val_dl, bce, opt, dev, scaler, rob_scheduler, rob_early_stopper, 
+                      max_flip_fraction=eps, epochs=epochs, use_scheduling=True)
         
         k_flips_for_name = int(eps * SEQ_LEN)
-        wio, acc, auc = evaluate_model(mdl,
+        wio, acc, auc, snr = evaluate_model(mdl,
                                   f"robust_k{k_flips_for_name}_seed{seed}",
                                   test_ds,
                                   dev,
@@ -674,8 +725,9 @@ def run_single_experiment(seed: int, epsilons_to_test: List[float], train_ds, te
         robust_wious.append(wio)
         robust_accs.append(acc)
         robust_aucs.append(auc)
+        robust_snrs.append(snr)
 
-    return std_wiou, std_acc, std_auc, robust_wious, robust_accs, robust_aucs
+    return std_wiou, std_acc, std_auc, std_snr, robust_wious, robust_accs, robust_aucs, robust_snrs
 
 
 # --------------------------------------------------------------------------- #
@@ -713,38 +765,55 @@ if __name__ == "__main__":
 
     print("--- single baseline run for visualisation ---")
     set_seeds(0)
+    
+    # Create a validation set from the main training data just for this viz run
+    viz_train_size = int(0.9 * len(main_train_ds))
+    viz_val_size = len(main_train_ds) - viz_train_size
+    viz_train_ds, viz_val_ds = random_split(main_train_ds, [viz_train_size, viz_val_size], generator=torch.Generator().manual_seed(0))
+
+    viz_train_dl = DataLoader(viz_train_ds, batch_size=64, shuffle=True)
+    viz_val_dl = DataLoader(viz_val_ds, batch_size=128)
+
+    # --- Standard model for visualization ---
     viz_model = TinyCNN().to(device)
     viz_opt = torch.optim.Adam(viz_model.parameters(), lr=1e-3)
-    viz_train_dl = DataLoader(main_train_ds, batch_size=64, shuffle=True)
+    viz_scaler = GradScaler()
+    epochs_viz = 30
+    viz_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(viz_opt, T_max=epochs_viz)
+    viz_early_stopper = EarlyStopping(patience=5, verbose=True)
 
-    train_standard_verbose(viz_model, viz_train_dl, bce, viz_opt, device)
+    train_standard(viz_model, viz_train_dl, viz_val_dl, bce, viz_opt, device, viz_scaler, viz_scheduler, viz_early_stopper, epochs=epochs_viz)
     evaluate_model(viz_model, "standard_baseline", main_test_ds, device, True)
-    # evaluate_model_gradcam(viz_model, "standard_baseline", main_test_ds, device, True)
     
     # --- Adversarial Analysis Section ---
     print("\n--- Training a single HotFlip model for analysis ---")
     set_seeds(0)
     hotflip_model_for_analysis = TinyCNN().to(device)
     hotflip_opt = torch.optim.Adam(hotflip_model_for_analysis.parameters(), lr=1e-3)
-    
-    analysis_flip_fraction = 0.0025 # Using 1% flips (k=10) for better distance visualization
-    train_hotflip_verbose(hotflip_model_for_analysis, viz_train_dl, bce, hotflip_opt, device, flip_fraction=analysis_flip_fraction)
+    hotflip_scaler = GradScaler()
+    hotflip_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(hotflip_opt, T_max=epochs_viz)
+    hotflip_early_stopper = EarlyStopping(patience=5, verbose=True)
+
+    analysis_flip_fraction = 0.01 # Using 1% flips (k=10)
+    train_hotflip(hotflip_model_for_analysis, viz_train_dl, viz_val_dl, bce, hotflip_opt, device, hotflip_scaler, hotflip_scheduler, hotflip_early_stopper, max_flip_fraction=analysis_flip_fraction, epochs=epochs_viz, use_scheduling=True)
     analyze_adversarial_examples(hotflip_model_for_analysis, main_test_ds, device, bce, flip_fraction=analysis_flip_fraction)
     evaluate_model(hotflip_model_for_analysis, "hotflip_baseline", main_test_ds, device, True)
 
     print("\n--- baseline plots generated. multi-seed experiments start ---\n")
 
-    all_std_wious, all_std_accs, all_std_aucs = [], [], []
-    all_rob_wious, all_rob_accs, all_rob_aucs = [], [], []
+    all_std_wious, all_std_accs, all_std_aucs, all_std_snrs = [], [], [], []
+    all_rob_wious, all_rob_accs, all_rob_aucs, all_rob_snrs = [], [], [], []
 
     for sd in SEEDS:
-        sw, sa, sa_auc, rw, ra, ra_auc = run_single_experiment(sd, EPSILONS, main_train_ds, main_test_ds)
+        sw, sa, sa_auc, sa_snr, rw, ra, ra_auc, ra_snr = run_single_experiment(sd, EPSILONS, main_train_ds, main_test_ds)
         all_std_wious.append(sw)
         all_std_accs.append(sa)
         all_std_aucs.append(sa_auc)
+        all_std_snrs.append(sa_snr)
         all_rob_wious.append(rw)
         all_rob_accs.append(ra)
         all_rob_aucs.append(ra_auc)
+        all_rob_snrs.append(ra_snr)
 
     # aggregate - wIoU
     std_wiou_mean = np.mean(all_std_wious)
@@ -766,6 +835,13 @@ if __name__ == "__main__":
     rob_auc_arr = np.array(all_rob_aucs)
     rob_auc_mean = rob_auc_arr.mean(axis=0)
     rob_auc_std = rob_auc_arr.std(axis=0)
+
+    # aggregate - saliency SNR
+    std_snr_mean = np.mean(all_std_snrs)
+    std_snr_std = np.std(all_std_snrs)
+    rob_snr_arr = np.array(all_rob_snrs)
+    rob_snr_mean = rob_snr_arr.mean(axis=0)
+    rob_snr_std = rob_snr_arr.std(axis=0)
 
     # plot wIoU vs eps
     plt.figure(figsize=(12, 8))
@@ -820,3 +896,18 @@ if __name__ == "__main__":
     plt.legend()
     plt.savefig("multi_seed_fgsm_vs_saliency_auc.png")
     print("Saved plot → multi_seed_fgsm_vs_saliency_auc.png")
+
+    # plot saliency SNR vs eps
+    plt.figure(figsize=(12, 8))
+    plt.plot(EPSILONS, rob_snr_mean, marker='o', label='Robust mean')
+    plt.fill_between(EPSILONS, rob_snr_mean - rob_snr_std, rob_snr_mean + rob_snr_std, alpha=0.2)
+    plt.axhline(std_snr_mean, color='r', ls='--', label=f'Standard mean ({std_snr_mean:.3f})')
+    plt.fill_between(EPSILONS, std_snr_mean - std_snr_std, std_snr_mean + std_snr_std, color='r', alpha=0.1)
+    plt.xscale('log')
+    plt.xlabel('Epsilon (Fraction of Sequence Flipped)')
+    plt.ylabel('Mean Saliency SNR')
+    plt.title('Epsilon vs Saliency SNR (10 seeds)')
+    plt.grid(True, which='both', ls='--')
+    plt.legend()
+    plt.savefig("multi_seed_fgsm_vs_saliency_snr.png")
+    print("Saved plot → multi_seed_fgsm_vs_saliency_snr.png")
