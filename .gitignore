@@ -52,3 +52,7 @@ tensorboard/
 
 # temporary paper
 wang22e.pdf
+s13059-023-02956-3.pdf
+
+# any png file with "filter_[0-9].png"
+filter_*.png

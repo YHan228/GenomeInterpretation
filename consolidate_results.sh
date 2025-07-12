@@ -44,17 +44,14 @@ for run_dir in $find_results; do
     if [ -d "$run_dir" ]; then
         echo "Processing: $run_dir"
 
-        # Use rsync to robustly merge the npz_results directory
-        if [ -d "${run_dir}/npz_results" ]; then
-            echo "  -> Merging npz_results..."
-            rsync -av "${run_dir}/npz_results/" "${DEST_DIR}/npz_results/"
-        fi
-        
-        # Use rsync to robustly merge the tensorboard directory
-        if [ -d "${run_dir}/tensorboard" ]; then
-            echo "  -> Merging tensorboard..."
-            rsync -av "${run_dir}/tensorboard/" "${DEST_DIR}/tensorboard/"
-        fi
+        # Use rsync to robustly merge all relevant subdirectories
+        for subdir in npz_results tensorboard; do
+            if [ -d "${run_dir}/${subdir}" ]; then
+                echo "  -> Merging ${subdir}..."
+                rsync -av --exclude='*/*' --include='*.png' "${run_dir}/${subdir}/" "${DEST_DIR}/${subdir}/" 2>/dev/null
+                rsync -av "${run_dir}/${subdir}/" "${DEST_DIR}/${subdir}/"
+            fi
+        done
     fi
 done
 
@@ -66,6 +63,9 @@ echo ""
 echo "You can now generate the final plots by running:"
 echo "python toy_slurm.py --aggregate_only --output_dir ${DEST_DIR}"
 echo "" 
+echo "Example:"
+echo "./consolidate_results.sh 8727062"
+echo "python toy_slurm.py --aggregate_only --output_dir slurm_results/job_8727062_consolidated"
 
 ## usage in console
 # ./consolidate_results.sh 8726751

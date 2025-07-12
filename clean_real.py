@@ -1,9 +1,13 @@
 """
+This script has been updated to use the more complex data generation scheme from
+the `final_gam_experiment.py` script.
+
 Synthetic 1-kbp phenotype dataset (SLURM-compatible version)
-    positives: high-GC background + one 60-bp causal block
-    negatives: low-GC background, no causal block
+    positives: high-GC background + multiple causal blocks and a promoter
+    negatives: low-GC background, decoys, or promoter-only sequences
 CNN training + Integrated Gradients attribution quality
 Author: Yichen Han, 2025-06-29
+Cleaned version: 2025-11-07
 
 --------------------------------------------------------------------------------
 High-level overview of the experimental design
@@ -13,12 +17,12 @@ of adversarial training on model interpretability in the presence of a feature
 confounder. The key components are:
 
 a. Synthetic Data Generation:
-   - binary classification task of 1 kbp DNA sequences.
-   - Negative examples: random background with a GC content of 50%.
-   - Positive examples: embedded with a conserved 60-bp "causal
-     motif" into a background with a higher GC content (a confounding feature). The
-     strength of the confounder is controlled by the `gc_pos` parameter, and the
-     strength of the true signal is controlled by the `conservation` parameter.
+   - The data generator creates positive examples with multiple causal blocks
+     and a promoter, alongside a mixed population of negative examples (decoys,
+     promoter-only, and pure background).
+   - The strength of the confounder is controlled by the `gc_pos` parameter
+     (which sets a `gc_gap`), and the strength of the true signal is controlled
+     by the `conservation` parameter.
 
 b. Adversarial Attack (HotFlip-style):
    - Adversarially-trained models are generated using an iterative,
@@ -41,10 +45,10 @@ c. Interpretability Metrics:
      attribution maps for each sequence. The quality of these maps is
      quantified using three metrics (all ranging from 0 to 1, except SNR):
      1. Windowed IoU (wIoU): Measures how well the attribution map *locates*
-        the true causal motif. It is the standard Intersection-over-Union
-        between the true motif's 60-bp mask and the predicted 60-bp mask
-        (defined as the window with the highest total attribution score). A
-        score of 1 indicates a perfect match.
+        the true causal signal. It is the standard Intersection-over-Union
+        between the true causal mask and a predicted mask (defined as the
+        window with the highest total attribution score). A score of 1 indicates
+        a perfect match.
      2. SaliencyAUC: Measures the *purity* of attributions. It is the
         probability that a randomly chosen position inside the motif has a
         higher attribution score than a randomly chosen position outside. A
@@ -100,11 +104,32 @@ except ImportError:
 # 1. Configuration & Utilities
 # --------------------------------------------------------------------------- #
 
-WITH_CONFOUNDER = True # Global switch for GC-content difference
+# --- Data Generation Settings (from final_gam_experiment.py) ---
+SEQ_LEN                = 1000
+BLOCKS_RANGE           = (3, 4)
+BLOCK_LEN_MEAN         = 55
+BLOCK_LEN_SD           = 15
+BLOCK_LEN_MIN, BLOCK_LEN_MAX = 40, 70
+PROMOTER_HEX_1, PROMOTER_HEX_2 = "TTGACA", "TATAAT"
+PROMOTER_SPACER        = 17
+MIN_GAP_BETWEEN_BLOCKS = 30
+DEFAULT_MOTIF_REPERTOIRE = 30
+N_ANCESTORS            = DEFAULT_MOTIF_REPERTOIRE
+N_TOTAL                = 10000 # Keep the original number of samples for this experiment
+TARGET_SIGNAL_FRAC     = 0.20
+DEFAULT_BATCH_SIZE     = 512 # Default training parameters
+DEFAULT_EPOCHS         = 50
 
-# --- Hyperparameter Search Space ---
-GC_HPARAMS = [0.55, 0.6, 0.65]
-CONS_HPARAMS = [0.6, 0.7, 0.8]
+# --- Hyperparameter Search Space (from toy_slurm.py) ---
+# GC_HPARAMS = [0.525, 0.535, 0.55, 0.575, 0.6, 0.625, 0.65] # OLD: gc_pos values
+# CONS_HPARAMS = [0.6, 0.7, 0.8]
+
+# New 3x3 grid based on gc_gap, as requested.
+# GC_GAP_HPARAMS will be [0.0, 0.1, 0.2]
+GC_GAP_HPARAMS = np.linspace(0.0, 0.2, 3).tolist()
+# CONS_HPARAMS will be [0.55, 0.75, 0.95]
+CONS_HPARAMS = np.linspace(0.55, 0.95, 3).tolist()
+
 # The target "effective epsilon" for randomized smoothing. Epsilon is defined
 # as 1 - E[P(original base)], where the expectation is over the Dirichlet noise.
 RS_EPSILON_HPARAMS = [0.01, 0.05, 0.10, 0.25, 0.40]
@@ -115,8 +140,7 @@ EPSILONS = [0.001, 0.005, 0.01, 0.05, 0.10, 0.15]
 
 # Directory to cache synthetic datasets so we do not regenerate the same
 # (gc, conservation) combination multiple times across different SLURM tasks.
-DATASET_CACHE_DIR = "dataset_cache"
-os.makedirs(DATASET_CACHE_DIR, exist_ok=True)
+DATASET_CACHE_DIR = "dataset_cache_real"
 
 # Default training parameters – can be overriden via CLI.
 DEFAULT_BATCH_SIZE = 512  # fits comfortably on V100 / T4
@@ -139,18 +163,10 @@ to_ix = {b: i for i, b in enumerate(ALPH)}
 
 
 def sample_background(length: int, gc: float) -> np.ndarray:
-    """iid sampling with given GC content, returns char array"""
-    p = np.array([(1 - gc) / 2, gc / 2, gc / 2, (1 - gc) / 2])  # A,C,G,T
+    p = np.array([(1 - gc) / 2, gc / 2, gc / 2, (1 - gc) / 2])
     return np.random.choice(ALPH, size=length, p=p)
 
-
-def random_chunk(length: int) -> np.ndarray:
-    """60-bp random chunk with balanced GC ≈ 50 %"""
-    return sample_background(length, 0.50)
-
-
 def mutate(chunk: np.ndarray, conservation: float) -> np.ndarray:
-    """Return a new chunk with given conservation level (≈ %identity)"""
     mutated_chunk = chunk.copy()
     n_to_mutate = int(len(chunk) * (1.0 - conservation))
     pos_to_mutate = np.random.choice(len(chunk), n_to_mutate, replace=False)
@@ -159,21 +175,34 @@ def mutate(chunk: np.ndarray, conservation: float) -> np.ndarray:
         mutated_chunk[pos] = np.random.choice(np.setdiff1d(ALPH, [original_base]))
     return mutated_chunk
 
-
-def embed(seq: np.ndarray, chunk: np.ndarray) -> Tuple[np.ndarray, int]:
-    """Insert chunk at random non-overlapping position; return new seq and start idx"""
-    L, l = len(seq), len(chunk)
-    start = np.random.randint(0, L - l + 1)
-    seq[start:start + l] = chunk
-    return seq, start
-
-
 def one_hot(seq: np.ndarray) -> np.ndarray:
-    """(1000,) char → (4,1000) float32 one-hot"""
+    """(L,) char → (4,L) float32 one-hot"""
     arr = np.zeros((4, len(seq)), dtype=np.float32)
     for i, b in enumerate(seq):
         arr[to_ix[b], i] = 1.0
     return arr
+
+def _trunc_norm(mu, sd, lo, hi, size=None):
+    while True:
+        v = np.random.normal(mu, sd, size)
+        if np.all((v >= lo) & (v <= hi)):
+            return v.astype(int)
+
+def _nonoverlap_positions(seq_len, lens):
+    tries = 0
+    while tries < 1000:
+        starts = sorted(np.random.randint(0, seq_len - sum(lens) - (len(lens) - 1) * MIN_GAP_BETWEEN_BLOCKS + 1, size=len(lens)))
+        offsets = np.array([0] + [l + MIN_GAP_BETWEEN_BLOCKS for l in lens[:-1]])
+        starts = np.array(starts) + np.cumsum(offsets)
+        if starts[-1] + lens[-1] <= seq_len:
+            if all(starts[i] + lens[i] + MIN_GAP_BETWEEN_BLOCKS <= starts[i+1] for i in range(len(starts)-1)):
+                return starts.tolist()
+        tries += 1
+    raise RuntimeError("Could not place blocks without overlap.")
+
+def build_promoter(gc):
+    spacer = sample_background(PROMOTER_SPACER, gc)
+    return np.array(list(PROMOTER_HEX_1 + ''.join(spacer) + PROMOTER_HEX_2), dtype="U1")
 
 
 def one_hot_to_seq(one_hot_tensor: torch.Tensor) -> str:
@@ -282,26 +311,41 @@ def log_conv1_motifs(
 # --------------------------------------------------------------------------- #
 
 
-def _dataset_cache_path(gc_pos: float, conservation: float) -> str:
-    """Return cache file path for a given (gc_pos, conservation)."""
+def _dataset_cache_path(gc_gap: float, conservation: float) -> str:
+    """Return cache file path for a given (gc_gap, conservation)."""
+    # Version 2 cache to avoid conflicts with old data format
     return os.path.join(
         DATASET_CACHE_DIR,
-        f"gc_{gc_pos:.3f}_cons_{conservation:.3f}.npz",
+        f"v2_gc-gap_{gc_gap:.3f}_cons_{conservation:.3f}.npz",
     )
 
 
-def load_or_generate_dataset(gc_pos: float, conservation: float):
+def load_or_generate_dataset(gc_gap: float, conservation: float):
     """Load dataset from cache if present, otherwise generate and cache it."""
-    cache_path = _dataset_cache_path(gc_pos, conservation)
+    # Ensure the cache directory exists right before we use it. This is a more
+    # robust pattern for cluster environments.
+    os.makedirs(DATASET_CACHE_DIR, exist_ok=True)
+
+    cache_path = _dataset_cache_path(gc_gap, conservation)
     if os.path.exists(cache_path):
+        print(f"Loading cached dataset from {cache_path}")
         data = np.load(cache_path)
         X = torch.tensor(data["X"], dtype=torch.float32)
         y = torch.tensor(data["y"], dtype=torch.float)
         masks = data["masks"]
         return SeqDS(X, y, masks)
 
-    ds = generate_dataset(gc_pos=gc_pos, conservation=conservation)
-    
+    print(f"Generating dataset with GC_gap={gc_gap:.3f} and conservation={conservation:.2f}...")
+
+    # We ignore the summary dict for now as it's not used in this script.
+    ds, _ = generate_dataset(
+        gc_gap=gc_gap,
+        conservation=conservation,
+        target_signal_frac=TARGET_SIGNAL_FRAC,
+        motif_repertoire=DEFAULT_MOTIF_REPERTOIRE,
+        include_partial_negatives=True,
+    )
+
     # --- Atomic saving to prevent race conditions in cluster environments ---
     temp_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
     temp_path = f"{cache_path}.{temp_id}.tmp"
@@ -313,11 +357,14 @@ def load_or_generate_dataset(gc_pos: float, conservation: float):
             y=ds.y.cpu().numpy(),
             masks=ds.m,
         )
-        os.rename(temp_path, cache_path)
+        # np.savez automatically appends '.npz', so the file to rename is temp_path + '.npz'
+        os.rename(f"{temp_path}.npz", cache_path)
     except Exception as e:
         print(f"Error caching dataset: {e}. Cleaning up temp file...")
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        # Also need to check for the correct temp file name during cleanup
+        final_temp_path = f"{temp_path}.npz"
+        if os.path.exists(final_temp_path):
+            os.remove(final_temp_path)
         raise # Re-raise the exception after cleanup
         
     return ds
@@ -327,56 +374,174 @@ def load_or_generate_dataset(gc_pos: float, conservation: float):
 # 2. Dataset generation
 # --------------------------------------------------------------------------- #
 
-SEQ_LEN = 1000
-CHUNK_LEN = 60
-N_TOTAL = 10000
-POS_N = N_TOTAL // 2
-NEG_N = N_TOTAL - POS_N
+class SeqDS(Dataset):
+    def __init__(self, xs, ys, ms):
+        self.x, self.y, self.m = xs, ys, ms
+    def __len__(self):
+        return len(self.x)
+    def __getitem__(self, idx):
+        return self.x[idx], self.y[idx], self.m[idx]
 
-def generate_dataset(gc_pos: float, conservation: float):
-    """Generates the main dataset based on global config."""
-    print(f"Generating dataset with GC_POS={gc_pos:.2f} and conservation={conservation:.2f}...")
-    GC_NEG = 0.50
+def generate_dataset(gc_gap: float, conservation: float, target_signal_frac: float,
+                     motif_repertoire: int = DEFAULT_MOTIF_REPERTOIRE,
+                     include_partial_negatives: bool = True) -> Tuple[SeqDS, dict]:
+
+    """Create dataset with possible partial-segment (decoy) negatives.
+
+    This function is migrated from final_gam_experiment.py.
+
+    Returns
+    -------
+    SeqDS
+        Dataset containing one-hot encoded sequences, labels and causal masks.
+    dict
+        Book-keeping summary for reproducibility.
+    """
+
+    # --- decide sample budget ---
+    # In this script, we use a fixed N_TOTAL from the global config.
+    POS_N = N_TOTAL // 2
+    NEG_N = N_TOTAL - POS_N
+
+    decoy_neg_n = int(0.2 * NEG_N) if include_partial_negatives else 0
+    promoter_only_neg_n = int(0.2 * NEG_N) # 20% of negatives are promoter-only
+    std_neg_n   = NEG_N - decoy_neg_n
+    background_only_neg_n = std_neg_n - promoter_only_neg_n
+
+    # build ancestral pool
+    ancestral_pool = []
+    for _ in range(motif_repertoire):
+        ancestor_gc = np.clip(np.random.normal(0.50 + gc_gap, 0.02), 0.25, 0.75)
+        ancestor_seq = sample_background(BLOCK_LEN_MAX, gc=ancestor_gc)
+        ancestral_pool.append(ancestor_seq)
 
     X, y, masks = [], [], []
-    master_chunk = random_chunk(CHUNK_LEN)
 
-    for _ in range(POS_N):
-        bg = sample_background(SEQ_LEN, gc=gc_pos)
-        chunk = mutate(master_chunk, conservation)
-        seq, start = embed(bg, chunk)
-        X.append(one_hot(seq))
-        y.append(1)
+    # --- Positive examples (must have ≥3 blocks + promoter) ---
+    n_pos_generated = 0
+    realised_fracs_pos = []
+    while n_pos_generated < POS_N:
+        current_gc_pos = np.clip(np.random.normal(0.50 + gc_gap, 0.04), 0.25, 0.75)
+        bg = sample_background(SEQ_LEN, gc=current_gc_pos)
+
+        n_blocks_mean = (target_signal_frac * SEQ_LEN) / BLOCK_LEN_MEAN
+        n_blocks_low  = int(np.floor(n_blocks_mean))
+        n_blocks_high = int(np.ceil(n_blocks_mean))
+        if n_blocks_low == n_blocks_high:
+            n_blocks_high += 1
+        n_blocks      = np.random.randint(max(3, n_blocks_low), max(4, n_blocks_high))
+
+        blk_lens   = _trunc_norm(BLOCK_LEN_MEAN, BLOCK_LEN_SD, BLOCK_LEN_MIN, BLOCK_LEN_MAX, n_blocks)
+        try:
+            blk_starts = _nonoverlap_positions(SEQ_LEN, blk_lens)
+        except RuntimeError:
+            continue # Try again if placement fails
+
         mask = np.zeros(SEQ_LEN, dtype=bool)
-        mask[start:start + CHUNK_LEN] = True
+        for blen, start in zip(blk_lens, blk_starts):
+            ancestor = random.choice(ancestral_pool)
+            master   = ancestor[:blen]
+            chunk    = mutate(master, conservation)
+            bg[start:start+blen] = chunk
+            mask[start:start+blen] = True
+
+        # mandatory σ70-like promoter
+        promoter_full_len = len(PROMOTER_HEX_1) + PROMOTER_SPACER + len(PROMOTER_HEX_2)
+        first_start = min(blk_starts)
+        if first_start < (promoter_full_len + MIN_GAP_BETWEEN_BLOCKS):
+            continue  # cannot fit promoter – try again
+
+        prom_seq = build_promoter(current_gc_pos)
+        prom_pos = first_start - promoter_full_len - MIN_GAP_BETWEEN_BLOCKS
+        if prom_pos < 0:
+            continue
+
+        bg[prom_pos: prom_pos + promoter_full_len] = prom_seq
+        mask[prom_pos: prom_pos + promoter_full_len] = True
+
+        # add finished positive
+        X.append(one_hot(bg))
+        y.append(1)
+        masks.append(mask)
+        realised_fracs_pos.append(mask.sum() / SEQ_LEN)
+        n_pos_generated += 1
+
+    # --- Decoy negatives (partial-segment) ---
+    for _ in range(decoy_neg_n):
+        current_gc = np.clip(np.random.normal(0.50, 0.04), 0.25, 0.75)
+        bg = sample_background(SEQ_LEN, gc=current_gc)
+
+        n_blocks = np.random.randint(1, 3)  # 1–2 blocks
+        blk_lens   = _trunc_norm(BLOCK_LEN_MEAN, BLOCK_LEN_SD, BLOCK_LEN_MIN, BLOCK_LEN_MAX, n_blocks)
+        try:
+            blk_starts = _nonoverlap_positions(SEQ_LEN, blk_lens)
+        except RuntimeError:
+            # If we fail, just generate a simple background sequence
+            X.append(one_hot(sample_background(SEQ_LEN, gc=current_gc)))
+            y.append(0)
+            masks.append(np.zeros(SEQ_LEN, dtype=bool))
+            continue
+
+        mask = np.zeros(SEQ_LEN, dtype=bool)
+        for blen, start in zip(blk_lens, blk_starts):
+            ancestor = random.choice(ancestral_pool)
+            master   = ancestor[:blen]
+            chunk    = mutate(master, conservation)
+            bg[start:start+blen] = chunk
+            mask[start:start+blen] = True
+
+        X.append(one_hot(bg))
+        y.append(0)
         masks.append(mask)
 
-    for _ in range(NEG_N):
-        bg = sample_background(SEQ_LEN, gc=GC_NEG)
+    # --- Promoter-only negatives ---
+    for _ in range(promoter_only_neg_n):
+        current_gc = np.clip(np.random.normal(0.50, 0.04), 0.25, 0.75)
+        bg = sample_background(SEQ_LEN, gc=current_gc)
+
+        prom_seq = build_promoter(current_gc)
+        promoter_full_len = len(prom_seq)
+
+        if SEQ_LEN >= promoter_full_len:
+            prom_pos = np.random.randint(0, SEQ_LEN - promoter_full_len + 1)
+            bg[prom_pos : prom_pos + promoter_full_len] = prom_seq
+
         X.append(one_hot(bg))
         y.append(0)
         masks.append(np.zeros(SEQ_LEN, dtype=bool))
 
-    X = torch.tensor(np.stack(X))
-    y = torch.tensor(y, dtype=torch.float)
+    # --- Standard negatives (no blocks / no promoter) ---
+    for _ in range(background_only_neg_n):
+        bg_gc = np.clip(np.random.normal(0.50, 0.04), 0.25, 0.75)
+        bg    = sample_background(SEQ_LEN, gc=bg_gc)
+        X.append(one_hot(bg))
+        y.append(0)
+        masks.append(np.zeros(SEQ_LEN, dtype=bool))
+
+    X = torch.from_numpy(np.stack(X)).float()
+    y = torch.from_numpy(np.array(y)).float()
     masks = np.stack(masks)
-    
-    return SeqDS(X, y, masks)
+
+    avg_realised_frac = np.mean(realised_fracs_pos) if realised_fracs_pos else 0.0
+
+    summary = {
+        "n_sequences": len(X),
+        "n_positive": POS_N,
+        "n_decoy_negative": decoy_neg_n,
+        "n_promoter_only_negative": promoter_only_neg_n,
+        "n_background_only_negative": background_only_neg_n,
+        "motif_repertoire": motif_repertoire,
+        "seed": np.random.get_state()[1][0].item() if len(np.random.get_state()[1]) > 0 else -1,
+        "target_signal_frac": target_signal_frac,
+        "avg_realised_frac": avg_realised_frac,
+    }
+
+    return SeqDS(X, y, masks), summary
 
 
 # --------------------------------------------------------------------------- #
 # 3. Model and Dataset Classes
 # --------------------------------------------------------------------------- #
-
-class SeqDS(Dataset):
-    def __init__(self, xs, ys, ms):
-        self.x, self.y, self.m = xs, ys, ms
-
-    def __len__(self):
-        return len(self.x)
-
-    def __getitem__(self, idx):
-        return self.x[idx], self.y[idx], self.m[idx]
 
 class TinyCNN(nn.Module):
     def __init__(self):
@@ -390,10 +555,10 @@ class TinyCNN(nn.Module):
     def forward(self, x):
         x = F.relu(self.conv1(x)); x = F.max_pool1d(x, 2)
         x = F.relu(self.conv2(x)); x = F.max_pool1d(x, 2)
-        conv3_out = F.relu(self.conv3(x)); x = F.max_pool1d(conv3_out, 2)
+        x = F.relu(self.conv3(x)); x = F.max_pool1d(x, 2)
         x = self.pool(x).squeeze(-1)
         logits = self.fc(x)
-        return logits.squeeze(-1), conv3_out
+        return logits.squeeze(-1)
 
 
 # --------------------------------------------------------------------------- #
@@ -409,7 +574,7 @@ def validate_epoch(model, loader, loss_fn, dev):
         for xb, yb, _ in loader:
             xb, yb = xb.to(dev), yb.to(dev)
             with autocast():
-                logits, _ = model(xb)
+                logits = model(xb)
                 loss = loss_fn(logits, yb)
             total_loss += loss.item()
             num_batches += 1
@@ -429,7 +594,7 @@ def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, sca
             xb, yb = xb.to(dev), yb.to(dev)
             optimizer.zero_grad()
             with autocast():
-                logits, conv_out = model(xb)
+                logits = model(xb)
                 loss = loss_fn(logits, yb)
 
             scaler.scale(loss).backward()
@@ -506,7 +671,7 @@ def train_random_smoothing(model, train_loader, val_loader, loss_fn, optimizer, 
 
             optimizer.zero_grad()
             with autocast():
-                logits_adv, _ = model(adv_xb)
+                logits_adv = model(adv_xb)
                 loss_adv = loss_fn(logits_adv, yb)
 
             scaler.scale(loss_adv).backward()
@@ -536,18 +701,16 @@ def train_random_smoothing(model, train_loader, val_loader, loss_fn, optimizer, 
             print(f"  -> Early stopping at epoch {epoch + 1} due to no improvement in val_loss for {early_stopping_patience} epochs.")
             break
 
-def generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction: float, 
-                              neighborhood_size: int = 20, penalize_nearby: bool = False):
+def generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction: float):
     seq_len = xb.shape[2]
     k_flips = int(flip_fraction * seq_len)
     adv_xb = xb.clone()
-    forbidden_regions = torch.zeros_like(adv_xb[:, 0, :], dtype=torch.bool, device=xb.device)
 
     for _ in range(k_flips):
         adv_xb.requires_grad = True
         model.zero_grad()
         with autocast():
-            logits, _ = model(adv_xb)
+            logits = model(adv_xb)
             loss = loss_fn(logits, yb)
         loss.backward()
         grad = adv_xb.grad.data
@@ -556,31 +719,23 @@ def generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction: float,
         saliency_scores = grad - grad_at_current_bases
         saliency_scores.masked_fill_(current_bases_onehot.bool(), -1e9)
         best_flip_scores_per_pos, _ = saliency_scores.max(dim=1)
-        if penalize_nearby:
-            best_flip_scores_per_pos.masked_fill_(forbidden_regions, -1e9)
         best_pos_to_flip = best_flip_scores_per_pos.argmax(dim=1)
         best_new_base_idx = saliency_scores[range(len(xb)), :, best_pos_to_flip].argmax(dim=1)
         old_base_idx = adv_xb[range(len(xb)), :, best_pos_to_flip].argmax(dim=1)
         adv_xb = adv_xb.detach()
         adv_xb[range(len(xb)), old_base_idx, best_pos_to_flip] = 0.0
         adv_xb[range(len(xb)), best_new_base_idx, best_pos_to_flip] = 1.0
-        if penalize_nearby:
-            pos = best_pos_to_flip
-            start = torch.clamp(pos - neighborhood_size, 0)
-            end = torch.clamp(pos + neighborhood_size + 1, max=seq_len)
-            indices = torch.arange(seq_len, device=xb.device).unsqueeze(0)
-            newly_forbidden = (indices >= start.unsqueeze(1)) & (indices < end.unsqueeze(1))
-            forbidden_regions |= newly_forbidden
     return adv_xb
 
 def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, writer, scheduler,
-                  max_flip_fraction: float, epochs: int = 10, use_scheduling: bool = True, early_stopping_patience: int = 10, early_stopping_min_delta: float = 1e-4) -> None:
+                  max_flip_fraction: float, epochs: int = 10, use_scheduling: bool = True, early_stopping_patience: int = 25, early_stopping_min_delta: float = 1e-4) -> None:
     
     scheduling_str = "ON" if use_scheduling else "OFF"
     early_stop_str = "ON" if use_scheduling else f"ON (patience={early_stopping_patience}, min_delta={early_stopping_min_delta})"
     print(f"Starting HotFlip training with max_flip_fraction = {max_flip_fraction:.4f}, Scheduling: {scheduling_str}, Early Stopping: {early_stop_str}...")
     
-    best_val_loss = float('inf')
+    # We now track the previous epoch's loss for our custom early stopping logic.
+    previous_val_loss = float('inf')
     early_stopping_counter = 0
 
     for epoch in range(epochs):
@@ -603,7 +758,7 @@ def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scal
             adv_xb = generate_hotflip_examples(model, xb, yb, loss_fn, current_flip_fraction)
             optimizer.zero_grad()
             with autocast():
-                logits_adv, conv_out_adv = model(adv_xb)
+                logits_adv = model(adv_xb)
                 loss_adv = loss_fn(logits_adv, yb)
 
             scaler.scale(loss_adv).backward()
@@ -615,7 +770,14 @@ def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scal
         avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
         avg_val_loss = validate_epoch(model, val_loader, loss_fn, dev)
         
-        # Step scheduler first, then log the potentially new LR
+        # For scheduled training, we help the LR scheduler by telling it to compare
+        # against the previous epoch's loss, not the global best, to account for
+        # the increasing difficulty. We do this by manually setting its internal state.
+        if use_scheduling:
+            scheduler.best = previous_val_loss
+
+        # The LR scheduler (`ReduceLROnPlateau`) will now use the value we just set
+        # (or its default global best if not in scheduled mode).
         scheduler.step(avg_val_loss)
         writer.add_scalar('Loss/train_adversarial', avg_train_loss, epoch)
         writer.add_scalar('Loss/validation_adversarial', avg_val_loss, epoch)
@@ -623,16 +785,19 @@ def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scal
         writer.add_scalar('Epsilon/train_adversarial', current_flip_fraction, epoch)
         print(f"  Epoch {epoch + 1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Epsilon: {current_flip_fraction:.4f}")
 
-        # Early stopping logic is now active for BOTH scheduled and non-scheduled runs.
-        # For scheduled runs, we monitor val_loss on a clean set, which should still converge.
-        if (best_val_loss - avg_val_loss) > early_stopping_min_delta:
-            best_val_loss = avg_val_loss
+        # Early stopping logic now compares with the *previous* epoch's val_loss,
+        # which is more robust for scheduled adversarial training where val_loss
+        # may not be monotonically decreasing.
+        if (previous_val_loss - avg_val_loss) > early_stopping_min_delta:
             early_stopping_counter = 0
         else:
             early_stopping_counter += 1
         
+        # Update previous_val_loss for the next iteration.
+        previous_val_loss = avg_val_loss
+        
         if early_stopping_counter >= early_stopping_patience:
-            print(f"  -> Early stopping at epoch {epoch + 1} due to no improvement in val_loss for {early_stopping_patience} epochs.")
+            print(f"  -> Early stopping at epoch {epoch + 1} due to no improvement in val_loss for {early_stopping_patience} consecutive epochs.")
             break
 
 def find_adversarial_baseline_pgd(model, xb: torch.Tensor, yb: torch.Tensor, dev: torch.device,
@@ -651,7 +816,7 @@ def find_adversarial_baseline_pgd(model, xb: torch.Tensor, yb: torch.Tensor, dev
     }
 
     with torch.no_grad(), autocast():
-        initial_logits, _ = model(adv_xb)
+        initial_logits = model(adv_xb)
         initial_pred_class = (initial_logits > 0).float()
         stats['initial_logit'] = initial_logits.item()
         stats['final_logit'] = initial_logits.item() # Default final logit
@@ -671,7 +836,7 @@ def find_adversarial_baseline_pgd(model, xb: torch.Tensor, yb: torch.Tensor, dev
     for i in range(num_iter):
         adv_xb.requires_grad = True
         with autocast():
-            logits, _ = model(adv_xb)
+            logits = model(adv_xb)
             loss = loss_fn(logits, yb.expand_as(logits))
         
         model.zero_grad()
@@ -686,7 +851,7 @@ def find_adversarial_baseline_pgd(model, xb: torch.Tensor, yb: torch.Tensor, dev
             delta = torch.clamp(delta, -epsilon, epsilon)
             adv_xb = torch.clamp(xb + delta, 0, 1)
 
-            current_logits, _ = model(adv_xb)
+            current_logits = model(adv_xb)
             current_pred_class = (current_logits > 0).float()
             
             if current_pred_class.item() != initial_pred_class.item():
@@ -697,7 +862,7 @@ def find_adversarial_baseline_pgd(model, xb: torch.Tensor, yb: torch.Tensor, dev
     
     # If no flip was found, final logit is the last one computed
     with torch.no_grad():
-        final_logits, _ = model(adv_xb)
+        final_logits = model(adv_xb)
         stats['final_logit'] = final_logits.item()
 
     return torch.zeros_like(xb, device=dev), stats
@@ -705,7 +870,7 @@ def find_adversarial_baseline_pgd(model, xb: torch.Tensor, yb: torch.Tensor, dev
 def evaluate_model(model, test_dl, dev):
     print(f"Evaluating model...")
     SAMPLE_N = 50  # Reduced from 100 for faster evaluation
-    ANALYSIS_CHUNK_LEN = 60
+    ANALYSIS_CHUNK_LEN = BLOCK_LEN_MEAN # Use mean block length for wIoU
 
     model.eval()
     correct, total = 0, 0
@@ -713,7 +878,7 @@ def evaluate_model(model, test_dl, dev):
         for xb, yb, _ in test_dl:
             xb, yb = xb.to(dev), yb.to(dev)
             with autocast():
-                logits, _ = model(xb)
+                logits = model(xb)
             preds = (torch.sigmoid(logits) > 0.5).float()
             correct += (preds == yb).sum().item()
             total += len(yb)
@@ -722,7 +887,7 @@ def evaluate_model(model, test_dl, dev):
 
     def model_for_captum(x):
         with autocast():
-            return model(x)[0].unsqueeze(-1)
+            return model(x).unsqueeze(-1)
 
     ig = IntegratedGradients(model_for_captum)
     test_ds = test_dl.dataset
@@ -737,7 +902,7 @@ def evaluate_model(model, test_dl, dev):
         print("Warning: No positive samples in test set for evaluation.")
         # Return default PGD stats for empty case
         default_pgd_stats = {'pgd_success_rate': 0, 'pgd_mean_iters_to_flip': 0}
-        return 0.0, accuracy, 0.0, 0.0, default_pgd_stats
+        return accuracy, 0.0, 0.0, default_pgd_stats
         
     idxs = rng.choice(positive_subset_indices, size=sample_n_actual, replace=False)
 
@@ -761,35 +926,18 @@ def evaluate_model(model, test_dl, dev):
             proportions = xb.mean(dim=2, keepdim=True)
             baseline = proportions.expand_as(xb)
 
-        raw_attributions = ig.attribute(xb, baselines=baseline, target=0)
+        attributions = ig.attribute(xb, baselines=baseline, target=0).abs().sum(1).squeeze(0).cpu().numpy()
         
-        # Apply the gradient correction from Majdandzic et al., Genome Biology 2023.
-        # This subtracts the mean attribution across all nucleotides at each position.
-        corrected_attributions = raw_attributions - raw_attributions.mean(dim=1, keepdim=True)
-        
-        # Calculate final contribution scores using the corrected attributions.
-        attributions = (corrected_attributions * xb).sum(1).squeeze(0).cpu().numpy()
-
-        window_sums = np.convolve(attributions, np.ones(ANALYSIS_CHUNK_LEN), mode='valid')
-        best_window_start = np.argmax(window_sums)
-        pred_mask_cont = np.zeros(SEQ_LEN, dtype=bool)
-        pred_mask_cont[best_window_start:best_window_start + ANALYSIS_CHUNK_LEN] = True
-        
-        # This is the correct "windowed" IoU, which is an unweighted IoU of masks.
-        inter_cont = (pred_mask_cont & mask).sum()
-        union_cont = (pred_mask_cont | mask).sum()
-        iou_cont = inter_cont / union_cont if union_cont else 0
-
         inside_scores = attributions[mask]
         outside_scores = attributions[~mask]
-        saliency_auc = (inside_scores[:, None] > outside_scores[None, :]).mean()
+        saliency_auc = (inside_scores[:, None] > outside_scores[None, :]).mean() if len(inside_scores) > 0 and len(outside_scores) > 0 else 0.5
         
         # New metric: Saliency "R-squared" (fraction of energy in motif)
         sum_sq_inside = np.sum(inside_scores**2)
         sum_sq_total = np.sum(attributions**2)
         saliency_snr = sum_sq_inside / (sum_sq_total + 1e-9)
 
-        results.append(dict(iou_cont=iou_cont, saliency_auc=saliency_auc, saliency_snr=saliency_snr))
+        results.append(dict(saliency_auc=saliency_auc, saliency_snr=saliency_snr))
 
     # --- Aggregate PGD Stats ---
     # Only consider attacks on initially correct predictions for success rate
@@ -807,26 +955,26 @@ def evaluate_model(model, test_dl, dev):
     
     print(f"  PGD baseline success rate: {pgd_success_rate:.3f}")
 
-    mean_iou_cont = np.mean([r['iou_cont'] for r in results])
     mean_saliency_auc = np.mean([r['saliency_auc'] for r in results])
     mean_saliency_snr = np.mean([r['saliency_snr'] for r in results])
-    print(f"  Mean wIoU: {mean_iou_cont:.3f}")
     print(f"  Mean Saliency AUC: {mean_saliency_auc:.3f}")
     print(f"  Mean Saliency SNR: {mean_saliency_snr:.3f}")
 
-    return mean_iou_cont, accuracy, mean_saliency_auc, mean_saliency_snr, pgd_stats
+    return accuracy, mean_saliency_auc, mean_saliency_snr, pgd_stats
 
 # --------------------------------------------------------------------------- #
 # 5. Experiment Runner
 # --------------------------------------------------------------------------- #
 
-def run_single_experiment(args, seed: int, main_ds, tb_run_dir: str, npz_run_dir: str, epochs: int, use_scheduling: bool):
+def run_single_experiment(args, seed: int, main_ds, tb_run_dir: str, npz_run_dir: str, epochs: int, use_scheduling: bool, single_param_val: float = None):
     print(f"\n{'=' * 20}  SEED {seed} | Schedule: {use_scheduling}  {'=' * 20}")
     
     # Create main training, validation, and test splits (70-15-15)
-    train_size = int(0.70 * N_TOTAL)
-    val_size = int(0.15 * N_TOTAL)
-    test_size = N_TOTAL - train_size - val_size
+    # The total number of samples is now determined by the dataset object itself.
+    current_n_total = len(main_ds)
+    train_size = int(0.70 * current_n_total)
+    val_size = int(0.15 * current_n_total)
+    test_size = current_n_total - train_size - val_size
     train_ds, val_ds, test_ds = random_split(
         main_ds,
         [train_size, val_size, test_size],
@@ -883,35 +1031,39 @@ def run_single_experiment(args, seed: int, main_ds, tb_run_dir: str, npz_run_dir
             pass  # compile not supported on this environment
     opt_standard = torch.optim.Adam(standard_model.parameters(), lr=1e-3)
     std_writer = SummaryWriter(log_dir=os.path.join(tb_run_dir, f"seed_{seed}", "standard"))
-    std_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_standard, 'min', factor=0.5, patience=4, verbose=True)
+    std_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_standard, 'min', factor=0.5, patience=8, verbose=True)
 
-    train_standard(standard_model, train_dl, val_dl, bce, opt_standard, dev, scaler, std_writer, std_scheduler, epochs=epochs, early_stopping_patience=10)
+    train_standard(standard_model, train_dl, val_dl, bce, opt_standard, dev, scaler, std_writer, std_scheduler, epochs=epochs, early_stopping_patience=15)
     
     # print("Standard model training complete. Saving and logging final motifs...")
     final_epoch_count = epochs # In future could get this from train function
     # log_conv1_motifs(standard_model, std_writer, final_epoch_count, output_dir=os.path.join(npz_run_dir, "standard"), save_to_disk=True, log_to_tb=True)
     
-    std_wiou, std_acc, std_auc, std_snr, std_pgd_stats = evaluate_model(standard_model, test_dl, dev)
+    std_acc, std_auc, std_snr, std_pgd_stats = evaluate_model(standard_model, test_dl, dev)
     std_writer.add_hparams(
         {'model': 'standard', 'epsilon': 0, 'seed': seed},
-        {'hparam/accuracy': std_acc, 'hparam/wIoU': std_wiou, 'hparam/saliency_auc': std_auc, 'hparam/saliency_snr': std_snr}
+        {'hparam/accuracy': std_acc, 'hparam/saliency_auc': std_auc, 'hparam/saliency_snr': std_snr}
     )
     std_writer.close()
 
-    robust_wious, robust_accs, robust_aucs, robust_snrs, robust_pgd_stats = [], [], [], [], []
+    robust_accs, robust_aucs, robust_snrs, robust_pgd_stats = [], [], [], []
     
     # --- Adversarial / Robustness Training Loop ---
-    training_params = []
+    # Determine the parameters to iterate over
     if args.experiment_mode == 'adv_vs_std':
         param_iterator = EPSILONS
-        training_func = train_hotflip
         param_name = 'epsilon'
     elif args.experiment_mode == 'random_smoothing':
         param_iterator = RS_EPSILON_HPARAMS
-        training_func = train_random_smoothing
         param_name = 'target_epsilon'
     else:
         param_iterator = []
+        param_name = 'param' # fallback
+
+    # If a single parameter value is provided (e.g., from a SLURM array job
+    # for random_smoothing), we override the iterator to run only for that value.
+    if single_param_val is not None:
+        param_iterator = [single_param_val]
 
     for param_val in param_iterator:
         set_seeds(seed)
@@ -923,33 +1075,34 @@ def run_single_experiment(args, seed: int, main_ds, tb_run_dir: str, npz_run_dir
                 pass
         opt = torch.optim.Adam(mdl.parameters(), lr=1e-3)
         rob_writer = SummaryWriter(log_dir=os.path.join(tb_run_dir, f"seed_{seed}", f"{param_name}_{param_val:.4f}"))
-        rob_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', factor=0.5, patience=4, verbose=True)
+        rob_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', factor=0.5, patience=8, verbose=True)
         
         # Branch for training function and its specific arguments
         if args.experiment_mode == 'adv_vs_std':
             if param_val > 0:
+                patience = 25 if use_scheduling else 15
                 train_hotflip(mdl, train_dl, val_dl, bce, opt, dev, scaler, rob_writer, rob_scheduler, 
-                              max_flip_fraction=param_val, epochs=epochs, use_scheduling=use_scheduling, early_stopping_patience=10)
+                              max_flip_fraction=param_val, epochs=epochs, use_scheduling=use_scheduling, early_stopping_patience=patience)
                 
                 motif_out_dir = os.path.join(npz_run_dir, f"hotflip_{param_name}_{param_val:.4f}")
                 # print(f"Robust model (param={param_val:.4f}) training complete. Saving and logging final motifs...")
                 # log_conv1_motifs(mdl, rob_writer, epochs, output_dir=motif_out_dir, save_to_disk=True, log_to_tb=True)
 
-                wio, acc, auc, snr, pgd_stats = evaluate_model(mdl, test_dl, dev)
+                acc, auc, snr, pgd_stats = evaluate_model(mdl, test_dl, dev)
                 hparams = {'model': 'robust', 'epsilon': param_val, 'seed': seed}
             else: # eps = 0 is just the standard model
-                wio, acc, auc, snr, pgd_stats = std_wiou, std_acc, std_auc, std_snr, std_pgd_stats
+                acc, auc, snr, pgd_stats = std_acc, std_auc, std_snr, std_pgd_stats
                 hparams = {'model': 'standard', 'epsilon': 0, 'seed': seed}
         
         elif args.experiment_mode == 'random_smoothing':
             train_random_smoothing(mdl, train_dl, val_dl, bce, opt, dev, scaler, rob_writer, rob_scheduler,
-                                   target_epsilon=param_val, epochs=epochs, early_stopping_patience=10)
+                                   target_epsilon=param_val, epochs=epochs, early_stopping_patience=15)
 
             motif_out_dir = os.path.join(npz_run_dir, f"rs_{param_name}_{param_val:.4f}")
             # print(f"Robust model (param={param_val:.4f}) training complete. Saving and logging final motifs...")
             # log_conv1_motifs(mdl, rob_writer, epochs, output_dir=motif_out_dir, save_to_disk=True, log_to_tb=True)
 
-            wio, acc, auc, snr, pgd_stats = evaluate_model(mdl, test_dl, dev)
+            acc, auc, snr, pgd_stats = evaluate_model(mdl, test_dl, dev)
             hparams = {'model': 'robust_rs', 'target_epsilon': param_val, 'seed': seed}
 
         else: # Should not happen
@@ -957,17 +1110,70 @@ def run_single_experiment(args, seed: int, main_ds, tb_run_dir: str, npz_run_dir
 
         rob_writer.add_hparams(
             hparams,
-            {'hparam/accuracy': acc, 'hparam/wIoU': wio, 'hparam/saliency_auc': auc, 'hparam/saliency_snr': snr}
+            {'hparam/accuracy': acc, 'hparam/saliency_auc': auc, 'hparam/saliency_snr': snr}
         )
-        robust_wious.append(wio); robust_accs.append(acc); robust_aucs.append(auc); robust_snrs.append(snr); robust_pgd_stats.append(pgd_stats)
+        robust_accs.append(acc); robust_aucs.append(auc); robust_snrs.append(snr); robust_pgd_stats.append(pgd_stats)
         rob_writer.close()
 
-    return std_wiou, std_acc, std_auc, std_snr, std_pgd_stats, robust_wious, robust_accs, robust_aucs, robust_snrs, robust_pgd_stats
+    return std_acc, std_auc, std_snr, std_pgd_stats, robust_accs, robust_aucs, robust_snrs, robust_pgd_stats
 
 
 # --------------------------------------------------------------------------- #
 # 6. Main entry-point
 # --------------------------------------------------------------------------- #
+
+def get_experiment_info(experiment_mode: str, array_idx: int) -> dict:
+    """
+    Maps array indices to specific experiment configurations.
+    
+    For 'adv_vs_std': 2 scheduling modes × 3 GC-gap × 3 conservation = 18 jobs
+    For 'random_smoothing': 3 GC-gap × 3 conservation × 5 epsilon = 45 jobs
+    
+    Returns a dict with the specific configuration for this array index.
+    """
+    if experiment_mode == 'adv_vs_std':
+        # Total 18 combinations: schedule × gc_gap × conservation
+        schedules = [True, False]
+        n_per_schedule = len(GC_GAP_HPARAMS) * len(CONS_HPARAMS)
+        
+        schedule_idx = array_idx // n_per_schedule
+        remainder = array_idx % n_per_schedule
+        gc_idx = remainder // len(CONS_HPARAMS)
+        cons_idx = remainder % len(CONS_HPARAMS)
+        
+        if schedule_idx >= len(schedules):
+            raise ValueError(f"Array index {array_idx} out of range for adv_vs_std (max: 17)")
+            
+        return {
+            'schedule': schedules[schedule_idx],
+            'gc_gap': GC_GAP_HPARAMS[gc_idx],
+            'cons': CONS_HPARAMS[cons_idx],
+            'description': f"schedule={'scheduled' if schedules[schedule_idx] else 'no_schedule'}, "
+                          f"gc_gap={GC_GAP_HPARAMS[gc_idx]:.3f}, cons={CONS_HPARAMS[cons_idx]:.2f}"
+        }
+        
+    elif experiment_mode == 'random_smoothing':
+        # Total 45 combinations: gc_gap × conservation × epsilon
+        n_per_gc = len(CONS_HPARAMS) * len(RS_EPSILON_HPARAMS)
+        
+        gc_idx = array_idx // n_per_gc
+        remainder = array_idx % n_per_gc
+        cons_idx = remainder // len(RS_EPSILON_HPARAMS)
+        eps_idx = remainder % len(RS_EPSILON_HPARAMS)
+        
+        if gc_idx >= len(GC_GAP_HPARAMS):
+            raise ValueError(f"Array index {array_idx} out of range for random_smoothing (max: 44)")
+            
+        return {
+            'gc_gap': GC_GAP_HPARAMS[gc_idx],
+            'cons': CONS_HPARAMS[cons_idx],
+            'epsilon': RS_EPSILON_HPARAMS[eps_idx],
+            'description': f"gc_gap={GC_GAP_HPARAMS[gc_idx]:.3f}, cons={CONS_HPARAMS[cons_idx]:.2f}, "
+                          f"epsilon={RS_EPSILON_HPARAMS[eps_idx]:.4f}"
+        }
+    else:
+        raise ValueError(f"Unknown experiment mode: {experiment_mode}")
+
 
 def main(args):
     # Set the multiprocessing start method to be safer for shared file systems
@@ -976,6 +1182,15 @@ def main(args):
         print("Multiprocessing start method set to 'forkserver'.")
     except RuntimeError:
         print("Multiprocessing start method already set.")
+
+    # Define param_iterator in this scope to make it available for np.savez
+    if args.experiment_mode == 'adv_vs_std':
+        param_iterator = EPSILONS
+    elif args.experiment_mode == 'random_smoothing':
+        param_iterator = RS_EPSILON_HPARAMS
+    else:
+        # This case should not be hit due to argparse choices, but for safety:
+        param_iterator = []
 
     # Determine scheduling mode from SLURM task ID
     if args.task_id is None:
@@ -994,37 +1209,60 @@ def main(args):
         base_schedule_dir = os.path.join(args.output_dir, schedule_mode_str)
 
         # --- Outer loop for Hyperparameter Search ---
-        for gc_hparam in GC_HPARAMS:
+        for gc_gap_hparam in GC_GAP_HPARAMS:
             for cons_hparam in CONS_HPARAMS:
                 
-                run_output_dir = os.path.join(base_schedule_dir, f"gc_{gc_hparam:.2f}_cons_{cons_hparam:.2f}")
+                run_output_dir = os.path.join(base_schedule_dir, f"gc-gap_{gc_gap_hparam:.3f}_cons_{cons_hparam:.2f}")
                 os.makedirs(run_output_dir, exist_ok=True)
                 
                 print(f"\n{'#'*60}")
-                print(f"## Starting HP experiment: GC={gc_hparam:.2f}, Conservation={cons_hparam:.2f}")
+                print(f"## Starting HP experiment: GC-Gap={gc_gap_hparam:.3f}, Conservation={cons_hparam:.2f}")
                 print(f"## Results will be saved to: {run_output_dir}")
                 print(f"{'#'*60}\n")
                 
-                main_dataset = load_or_generate_dataset(gc_pos=gc_hparam, conservation=cons_hparam)
+                main_dataset = load_or_generate_dataset(gc_gap=gc_gap_hparam, conservation=cons_hparam)
                 
-                all_std_wious, all_std_accs, all_std_aucs, all_std_snrs, all_std_pgd_stats = [], [], [], [], []
-                all_rob_wious, all_rob_accs, all_rob_aucs, all_rob_snrs, all_rob_pgd_stats = [], [], [], [], []
+                all_std_accs, all_std_aucs, all_std_snrs, all_std_pgd_stats = [], [], [], []
+                all_rob_accs, all_rob_aucs, all_rob_snrs, all_rob_pgd_stats = [], [], [], []
 
                 for sd in SEEDS:
-                    sw, sa, sa_auc, s_snr, s_pgd, rw, ra, ra_auc, r_snr, r_pgd = run_single_experiment(
+                    sa, sa_auc, s_snr, s_pgd, ra, ra_auc, r_snr, r_pgd = run_single_experiment(
                         args, sd, main_dataset, run_output_dir, run_output_dir, args.epochs, use_scheduling
                     )
-                    all_std_wious.append(sw); all_std_accs.append(sa); all_std_aucs.append(sa_auc); all_std_snrs.append(s_snr); all_std_pgd_stats.append(s_pgd)
-                    all_rob_wious.append(rw); all_rob_accs.append(ra); all_rob_aucs.append(ra_auc); all_rob_snrs.append(r_snr); all_rob_pgd_stats.append(r_pgd)
+                    all_std_accs.append(sa); all_std_aucs.append(sa_auc); all_std_snrs.append(s_snr); all_std_pgd_stats.append(s_pgd)
+                    all_rob_accs.append(ra); all_rob_aucs.append(ra_auc); all_rob_snrs.append(r_snr); all_rob_pgd_stats.append(r_pgd)
 
                 # --- Save Raw Results ---
+                # Save with consistent structure matching main_single_combo
+                save_payload = {
+                    'experiment_mode': args.experiment_mode,
+                    'seeds': SEEDS,
+                    'gc_pos': 0.5 + gc_gap_hparam,
+                    'conservation': cons_hparam,
+                    # Always save metrics as simple Python lists
+                    'std_accs': [float(x) for x in all_std_accs],
+                    'std_aucs': [float(x) for x in all_std_aucs],
+                    'std_snrs': [float(x) for x in all_std_snrs],
+                    # For sweep mode, rob_* will be shape (n_seeds, n_params)
+                    'rob_accs': [[float(x) for x in seed_results] for seed_results in all_rob_accs],
+                    'rob_aucs': [[float(x) for x in seed_results] for seed_results in all_rob_aucs],
+                    'rob_snrs': [[float(x) for x in seed_results] for seed_results in all_rob_snrs],
+                    'std_pgd_stats': all_std_pgd_stats,
+                    'rob_pgd_stats': all_rob_pgd_stats
+                }
+                
+                # Add experiment-specific parameters
+                if args.experiment_mode == 'adv_vs_std':
+                    save_payload['param_name'] = 'epsilon'
+                    save_payload['param_values'] = param_iterator
+                    save_payload['scheduling'] = use_scheduling
+                elif args.experiment_mode == 'random_smoothing':
+                    save_payload['param_name'] = 'target_epsilon'
+                    save_payload['param_values'] = param_iterator
+                
                 np.savez(
                     os.path.join(run_output_dir, 'multi_seed_results.npz'),
-                    epsilons=EPSILONS, seeds=SEEDS,
-                    gc_pos=gc_hparam, conservation=cons_hparam,
-                    std_wious=all_std_wious, std_accs=all_std_accs, std_aucs=all_std_aucs, std_snrs=all_std_snrs,
-                    rob_wious=all_rob_wious, rob_accs=all_rob_accs, rob_aucs=all_rob_aucs, rob_snrs=all_rob_snrs,
-                    std_pgd_stats=all_std_pgd_stats, rob_pgd_stats=all_rob_pgd_stats
+                    **save_payload
                 )
                 print(f"\nSaved raw results to {os.path.join(run_output_dir, 'multi_seed_results.npz')}")
 
@@ -1051,48 +1289,35 @@ def main(args):
 
 def main_single_combo(args, array_idx: int):
     """Run experiments for a single combination determined by array_idx."""
-
-    # Build mapping lists for each experimental mode
-    if args.experiment_mode == 'adv_vs_std':
-        combos = []
-        for schedule in [True, False]:
-            for gc_val in GC_HPARAMS:
-                for cons_val in CONS_HPARAMS:
-                    combos.append({'schedule': schedule, 'gc': gc_val, 'cons': cons_val})
-    elif args.experiment_mode == 'random_smoothing':
-        combos = []
-        for gc_val in GC_HPARAMS:
-            for cons_val in CONS_HPARAMS:
-                for eps_val in RS_EPSILON_HPARAMS:
-                    combos.append({'gc': gc_val, 'cons': cons_val, 'epsilon': eps_val})
-    else:
-        raise ValueError(f"Unknown experiment mode: {args.experiment_mode}")
-
-    num_jobs = len(combos)
-    if array_idx < 0 or array_idx >= num_jobs:
-        raise ValueError(
-            f"array_idx {array_idx} is out of range for mode '{args.experiment_mode}' (0-{num_jobs - 1})")
-
-    combo = combos[array_idx]
-    gc_hparam, cons_hparam = combo['gc'], combo['cons']
-
+    
+    # Get the specific configuration for this array index
+    try:
+        config = get_experiment_info(args.experiment_mode, array_idx)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    
+    print(f"Running experiment: {config['description']}")
+    
+    # Extract parameters from config
+    gc_gap_hparam = config['gc_gap']
+    cons_hparam = config['cons']
+    use_scheduling = config.get('schedule', False)
+    single_param_val = config.get('epsilon', None)
+    
     # --- Set up paths and print info ---
     if args.experiment_mode == 'adv_vs_std':
-        use_scheduling = combo['schedule']
         schedule_mode_str = "scheduled" if use_scheduling else "no_schedule"
-        run_spec_str = f"gc_{gc_hparam:.3f}_cons_{cons_hparam:.2f}"
+        run_spec_str = f"gc-gap_{gc_gap_hparam:.3f}_cons_{cons_hparam:.2f}"
         tb_run_dir = os.path.join(args.output_dir, "tensorboard", schedule_mode_str, run_spec_str)
         npz_run_dir = os.path.join(args.output_dir, "npz_results", schedule_mode_str, run_spec_str)
-        print(f"Running single-combo job: schedule={schedule_mode_str}, GC={gc_hparam:.3f}, CONS={cons_hparam:.2f}")
     
     elif args.experiment_mode == 'random_smoothing':
-        use_scheduling = False # Not used in this mode
-        eps_hparam = combo['epsilon']
+        eps_hparam = config['epsilon']
         mode_str = "random_smoothing"
-        run_spec_str = f"gc_{gc_hparam:.3f}_cons_{cons_hparam:.2f}_eps_{eps_hparam:.4f}"
+        run_spec_str = f"gc-gap_{gc_gap_hparam:.3f}_cons_{cons_hparam:.2f}_eps_{eps_hparam:.4f}"
         tb_run_dir = os.path.join(args.output_dir, "tensorboard", mode_str, run_spec_str)
         npz_run_dir = os.path.join(args.output_dir, "npz_results", mode_str, run_spec_str)
-        print(f"Running single-combo job: mode={mode_str}, GC={gc_hparam:.3f}, CONS={cons_hparam:.2f}, Epsilon={eps_hparam:.4f}")
         
     os.makedirs(tb_run_dir, exist_ok=True)
     os.makedirs(npz_run_dir, exist_ok=True)
@@ -1100,10 +1325,10 @@ def main_single_combo(args, array_idx: int):
     print(f"  - Tensorboard logs will be saved to: {tb_run_dir}")
     print(f"  - NPZ results will be saved to: {npz_run_dir}")
 
-    main_dataset = load_or_generate_dataset(gc_pos=gc_hparam, conservation=cons_hparam)
+    main_dataset = load_or_generate_dataset(gc_gap=gc_gap_hparam, conservation=cons_hparam)
 
-    all_std_wious, all_std_accs, all_std_aucs, all_std_snrs, all_std_pgd_stats = [], [], [], [], []
-    all_rob_wious, all_rob_accs, all_rob_aucs, all_rob_snrs, all_rob_pgd_stats = [], [], [], [], []
+    all_std_accs, all_std_aucs, all_std_snrs, all_std_pgd_stats = [], [], [], []
+    all_rob_accs, all_rob_aucs, all_rob_snrs, all_rob_pgd_stats = [], [], [], []
 
     # Training parameters derived from CLI / environment
     global TRAIN_BATCH_SIZE, NUM_WORKERS
@@ -1112,27 +1337,39 @@ def main_single_combo(args, array_idx: int):
 
     for sd in SEEDS:
         # Pass args to the runner function so it knows the mode
-        sw, sa, sa_auc, s_snr, s_pgd, rw, ra, ra_auc, r_snr, r_pgd = run_single_experiment(
-            args, sd, main_dataset, tb_run_dir, npz_run_dir, args.epochs, use_scheduling
+        sa, sa_auc, s_snr, s_pgd, ra, ra_auc, r_snr, r_pgd = run_single_experiment(
+            args, sd, main_dataset, tb_run_dir, npz_run_dir, args.epochs, use_scheduling, single_param_val
         )
-        all_std_wious.append(sw); all_std_accs.append(sa); all_std_aucs.append(sa_auc); all_std_snrs.append(s_snr); all_std_pgd_stats.append(s_pgd)
-        all_rob_wious.append(rw); all_rob_accs.append(ra); all_rob_aucs.append(ra_auc); all_rob_snrs.append(r_snr); all_rob_pgd_stats.append(r_pgd)
+        all_std_accs.append(sa); all_std_aucs.append(sa_auc); all_std_snrs.append(s_snr); all_std_pgd_stats.append(s_pgd)
+        all_rob_accs.append(ra); all_rob_aucs.append(ra_auc); all_rob_snrs.append(r_snr); all_rob_pgd_stats.append(r_pgd)
 
-    # Save raw results just like in the sweep mode
+    # Save raw results with consistent structure for all experiment types
     save_payload = {
+        'experiment_mode': args.experiment_mode,
         'seeds': SEEDS,
-        'gc_pos': gc_hparam,
+        'gc_pos': 0.5 + gc_gap_hparam,
         'conservation': cons_hparam,
-        'std_wious': all_std_wious, 'std_accs': all_std_accs, 'std_aucs': all_std_aucs, 'std_snrs': all_std_snrs,
-        'rob_wious': all_rob_wious, 'rob_accs': all_rob_accs, 'rob_aucs': all_rob_aucs, 'rob_snrs': all_rob_snrs,
-        'std_pgd_stats': all_std_pgd_stats, 'rob_pgd_stats': all_rob_pgd_stats
+        # Always save metrics as simple Python lists (not numpy arrays)
+        'std_accs': [float(x) for x in all_std_accs],
+        'std_aucs': [float(x) for x in all_std_aucs], 
+        'std_snrs': [float(x) for x in all_std_snrs],
+        # For single-param experiments, rob_* will be shape (n_seeds,)
+        # For multi-param experiments, rob_* will be shape (n_seeds, n_params)
+        'rob_accs': all_rob_accs,
+        'rob_aucs': all_rob_aucs,
+        'rob_snrs': all_rob_snrs,
+        'std_pgd_stats': all_std_pgd_stats,
+        'rob_pgd_stats': all_rob_pgd_stats
     }
+    
+    # Add experiment-specific parameters
     if args.experiment_mode == 'adv_vs_std':
-        save_payload['epsilons'] = EPSILONS
+        save_payload['param_name'] = 'epsilon'
+        save_payload['param_values'] = EPSILONS
         save_payload['scheduling'] = use_scheduling
     elif args.experiment_mode == 'random_smoothing':
-        save_payload['rs_epsilons'] = RS_EPSILON_HPARAMS
-        save_payload['epsilon_used'] = eps_hparam
+        save_payload['param_name'] = 'target_epsilon'
+        save_payload['param_values'] = [eps_hparam]  # Only the single epsilon used
 
     np.savez(os.path.join(npz_run_dir, "multi_seed_results.npz"), **save_payload)
 
@@ -1196,12 +1433,37 @@ if __name__ == "__main__":
         choices=['adv_vs_std', 'random_smoothing'],
         help="Which set of experiments to run (training only).",
     )
+    parser.add_argument(
+        "--test_mapping",
+        action="store_true",
+        help="Test the array index mapping without running experiments.",
+    )
 
     args = parser.parse_args()
 
     # Update global DataLoader defaults
     TRAIN_BATCH_SIZE = args.batch_size
     NUM_WORKERS = args.num_workers
+
+    # ------------------------------------------------------------------ #
+    # Test mapping mode
+    # ------------------------------------------------------------------ #
+    
+    if args.test_mapping:
+        print("Testing array index mapping...")
+        print("\n=== Adversarial vs Standard (adv_vs_std) ===")
+        print("Total jobs: 18 (indices 0-17)")
+        for i in range(18):
+            config = get_experiment_info('adv_vs_std', i)
+            print(f"  Index {i:2d}: {config['description']}")
+        
+        print("\n=== Randomized Smoothing (random_smoothing) ===")
+        print("Total jobs: 45 (indices 0-44)")
+        for i in range(45):
+            config = get_experiment_info('random_smoothing', i)
+            print(f"  Index {i:2d}: {config['description']}")
+        
+        sys.exit(0)
 
     # ------------------------------------------------------------------ #
     # Aggregate-only fast path
@@ -1224,69 +1486,131 @@ if __name__ == "__main__":
         
         print(f"Found {len(npz_files)} result files, building master dataframe...")
         all_data = []
+        
+        # Group files by experiment type for debugging
+        rs_files = [f for f in npz_files if 'random_smoothing' in f]
+        adv_files = [f for f in npz_files if 'random_smoothing' not in f]
+        print(f"  - RandomSmoothing files: {len(rs_files)}")
+        print(f"  - Adversarial training files: {len(adv_files)}")
+        
         for f_path in npz_files:
             try:
                 data = np.load(f_path, allow_pickle=True)
                 
-                is_scheduled = data.get('scheduling') and data['scheduling'].item()
-                scheduling_mode = "scheduled" if is_scheduled else "no_schedule"
-                
-                mode = 'adv_vs_std'
-                if 'rs_epsilons' in data or 'random_smoothing' in f_path:
-                    mode = 'random_smoothing'
-
+                # Extract basic metadata
+                experiment_mode = data.get('experiment_mode', 'adv_vs_std').item() if 'experiment_mode' in data else 'adv_vs_std'
                 gc_pos = float(data['gc_pos'].item())
                 cons = float(data['conservation'].item())
                 seeds = data['seeds']
                 
-                std_metrics = {
-                    'wIoU': data['std_wious'], 'Accuracy': data['std_accs'],
-                    'SaliencyAUC': data['std_aucs'], 'SaliencySNR': data['std_snrs']
-                }
-                # PGD stats are arrays of dicts, so we handle them carefully.
-                std_pgd_stats = data.get('std_pgd_stats', [{} for _ in seeds])
-
-                rob_metrics = {
-                    'wIoU': data['rob_wious'], 'Accuracy': data['rob_accs'],
-                    'SaliencyAUC': data['rob_aucs'], 'SaliencySNR': data['rob_snrs']
-                }
-                # PGD stats for robust models are arrays of lists of dicts.
-                rob_pgd_stats = data.get('rob_pgd_stats', [[] for _ in seeds])
-
-                if mode == 'adv_vs_std':
-                    params = data['epsilons']
-                    param_name = 'epsilon'
-                else: # random_smoothing
-                    params = data.get('rs_epsilons', RS_EPSILON_HPARAMS) # fallback
-                    param_name = 'target_epsilon'
+                # Determine scheduling mode
+                if 'random_smoothing' in f_path or experiment_mode == 'random_smoothing':
+                    mode = 'random_smoothing'
+                    scheduling_mode = 'n/a'
+                else:
+                    mode = 'adv_vs_std'
+                    is_scheduled = data.get('scheduling', False)
+                    if hasattr(is_scheduled, 'item'):
+                        is_scheduled = is_scheduled.item()
+                    scheduling_mode = "scheduled" if is_scheduled else "no_schedule"
                 
+                # Get parameter info
+                param_name = data.get('param_name', 'epsilon' if mode == 'adv_vs_std' else 'target_epsilon')
+                if hasattr(param_name, 'item'):
+                    param_name = param_name.item()
+                param_values = data.get('param_values', data.get('epsilons', [0]))
+                
+                # Load metrics
+                std_metrics = {
+                    'Accuracy': data['std_accs'],
+                    'SaliencyAUC': data['std_aucs'],
+                    'SaliencySNR': data['std_snrs']
+                }
+                rob_metrics = {
+                    'Accuracy': data['rob_accs'],
+                    'SaliencyAUC': data['rob_aucs'],
+                    'SaliencySNR': data['rob_snrs']
+                }
+                
+                # PGD stats (with defaults for older files)
+                std_pgd_stats = data.get('std_pgd_stats', [{} for _ in seeds])
+                rob_pgd_stats = data.get('rob_pgd_stats', [[] for _ in seeds])
+                
+                # Add standard model results (param_val = 0)
                 for i, seed in enumerate(seeds):
                     all_data.append({
-                        'scheduling_mode': scheduling_mode, 'mode': mode,
-                        'gc_pos': gc_pos, 'conservation': cons, 'seed': seed,
-                        'param_name': param_name, 'param_val': 0,
-                        'wIoU': std_metrics['wIoU'][i], 'Accuracy': std_metrics['Accuracy'][i],
-                        'SaliencyAUC': std_metrics['SaliencyAUC'][i], 'SaliencySNR': std_metrics['SaliencySNR'][i],
-                        'pgd_success_rate': std_pgd_stats[i].get('pgd_success_rate', 0),
-                        'pgd_mean_iters_to_flip': std_pgd_stats[i].get('pgd_mean_iters_to_flip', 0)
+                        'scheduling_mode': scheduling_mode,
+                        'mode': mode,
+                        'gc_pos': gc_pos,
+                        'conservation': cons,
+                        'seed': int(seed),
+                        'param_name': param_name,
+                        'param_val': 0.0,
+                        'Accuracy': float(std_metrics['Accuracy'][i]),
+                        'SaliencyAUC': float(std_metrics['SaliencyAUC'][i]),
+                        'SaliencySNR': float(std_metrics['SaliencySNR'][i]),
+                        'pgd_success_rate': float(std_pgd_stats[i].get('pgd_success_rate', 0)),
+                        'pgd_mean_iters_to_flip': float(std_pgd_stats[i].get('pgd_mean_iters_to_flip', 0))
                     })
-                    
-                    for j, p_val in enumerate(params):
-                        # Handle potentially missing PGD stats in older files
-                        pgd_stats_list = rob_pgd_stats[i] if rob_pgd_stats is not None and i < len(rob_pgd_stats) else []
-                        current_pgd_stats = pgd_stats_list[j] if pgd_stats_list is not None and j < len(pgd_stats_list) else {}
-
+                
+                # Add robust model results
+                # Check if rob_metrics is 1D (single param) or 2D (multiple params)
+                if len(param_values) == 1:
+                    # Single parameter case (e.g., RandomSmoothing with one epsilon)
+                    p_val = float(param_values[0])
+                    for i, seed in enumerate(seeds):
+                        # Handle both old format (2D with second dim=1) and new format (1D)
+                        if hasattr(rob_metrics['Accuracy'][i], '__len__'):
+                            rob_acc = float(rob_metrics['Accuracy'][i][0])
+                            rob_auc = float(rob_metrics['SaliencyAUC'][i][0])
+                            rob_snr = float(rob_metrics['SaliencySNR'][i][0])
+                        else:
+                            rob_acc = float(rob_metrics['Accuracy'][i])
+                            rob_auc = float(rob_metrics['SaliencyAUC'][i])
+                            rob_snr = float(rob_metrics['SaliencySNR'][i])
+                        
+                        current_pgd_stats = rob_pgd_stats[i][0] if rob_pgd_stats[i] else {}
+                        
                         all_data.append({
-                            'scheduling_mode': scheduling_mode, 'mode': mode,
-                            'gc_pos': gc_pos, 'conservation': cons, 'seed': seed,
-                            'param_name': param_name, 'param_val': p_val,
-                            'wIoU': rob_metrics['wIoU'][i, j], 'Accuracy': rob_metrics['Accuracy'][i, j],
-                            'SaliencyAUC': rob_metrics['SaliencyAUC'][i, j], 'SaliencySNR': rob_metrics['SaliencySNR'][i, j],
-                            'pgd_success_rate': current_pgd_stats.get('pgd_success_rate', 0),
-                            'pgd_mean_iters_to_flip': current_pgd_stats.get('pgd_mean_iters_to_flip', 0),
+                            'scheduling_mode': scheduling_mode,
+                            'mode': mode,
+                            'gc_pos': gc_pos,
+                            'conservation': cons,
+                            'seed': int(seed),
+                            'param_name': param_name,
+                            'param_val': p_val,
+                            'Accuracy': rob_acc,
+                            'SaliencyAUC': rob_auc,
+                            'SaliencySNR': rob_snr,
+                            'pgd_success_rate': float(current_pgd_stats.get('pgd_success_rate', 0)),
+                            'pgd_mean_iters_to_flip': float(current_pgd_stats.get('pgd_mean_iters_to_flip', 0))
                         })
+                else:
+                    # Multiple parameter case (e.g., adversarial with multiple epsilons)
+                    for j, p_val in enumerate(param_values):
+                        for i, seed in enumerate(seeds):
+                            pgd_stats_list = rob_pgd_stats[i] if rob_pgd_stats is not None and i < len(rob_pgd_stats) else []
+                            current_pgd_stats = pgd_stats_list[j] if pgd_stats_list and j < len(pgd_stats_list) else {}
+                            
+                            all_data.append({
+                                'scheduling_mode': scheduling_mode,
+                                'mode': mode,
+                                'gc_pos': gc_pos,
+                                'conservation': cons,
+                                'seed': int(seed),
+                                'param_name': param_name,
+                                'param_val': float(p_val),
+                                'Accuracy': float(rob_metrics['Accuracy'][i][j]),
+                                'SaliencyAUC': float(rob_metrics['SaliencyAUC'][i][j]),
+                                'SaliencySNR': float(rob_metrics['SaliencySNR'][i][j]),
+                                'pgd_success_rate': float(current_pgd_stats.get('pgd_success_rate', 0)),
+                                'pgd_mean_iters_to_flip': float(current_pgd_stats.get('pgd_mean_iters_to_flip', 0))
+                            })
+                            
             except Exception as e:
                 print(f"Could not process file {f_path}: {e}")
+                import traceback
+                traceback.print_exc()
 
         df = pd.DataFrame(all_data)
         master_csv_path = os.path.join(plots_dir, 'full_results_long_format.csv')
@@ -1304,18 +1628,18 @@ if __name__ == "__main__":
 
         baseline_metrics = df[df['model_type'] == 'Standard'].groupby(
             ['gc_pos', 'conservation', 'seed']
-        ).mean(numeric_only=True).reset_index()
+        )[['Accuracy', 'SaliencyAUC', 'SaliencySNR']].mean().reset_index()
 
         df_robust = df[df['model_type'] != 'Standard'].copy()
         
         df_robust = pd.merge(
             df_robust,
-            baseline_metrics[['gc_pos', 'conservation', 'seed', 'wIoU', 'Accuracy', 'SaliencyAUC', 'SaliencySNR']],
+            baseline_metrics[['gc_pos', 'conservation', 'seed', 'Accuracy', 'SaliencyAUC', 'SaliencySNR']],
             on=['gc_pos', 'conservation', 'seed'],
             suffixes=('', '_base')
         )
 
-        metrics_to_plot = ['wIoU', 'Accuracy', 'SaliencyAUC', 'SaliencySNR']
+        metrics_to_plot = ['Accuracy', 'SaliencyAUC', 'SaliencySNR']
         for metric in metrics_to_plot:
             df_robust[f'delta_{metric}'] = df_robust[metric] - df_robust[f'{metric}_base']
 
@@ -1332,7 +1656,6 @@ if __name__ == "__main__":
         model_type_to_sched = {
             'Adversarial (No Schedule)': 'no_schedule',
             'Adversarial (Scheduled)': 'scheduled',
-            'RandomSmoothing': 'no_schedule'
         }
         
         for metric in metrics_to_plot:
@@ -1345,9 +1668,10 @@ if __name__ == "__main__":
                 data=df_plot_box, x="param_val", y=f"delta_{metric}",
                 hue="conservation", col="model_type", row="gc_pos",
                 kind="box", height=3, aspect=1.2, palette='viridis',
-                fliersize=1.5, linewidth=1.0, showfliers=True, sharey=False, sharex=False,
+                fliersize=0, linewidth=1.0, showfliers=False, sharey=False, sharex=False,
                 margin_titles=True,
-                col_order=['Adversarial (No Schedule)', 'Adversarial (Scheduled)', 'RandomSmoothing']
+                col_order=['Adversarial (No Schedule)', 'Adversarial (Scheduled)', 'RandomSmoothing'],
+                whis=1.5  # Standard IQR whiskers
             )
             
             g.fig.suptitle(f"Improvement in {metric} vs. Standard, by Training Strategy", y=1.05, fontsize=16)
@@ -1357,8 +1681,10 @@ if __name__ == "__main__":
                 
                 gc_val = g.row_names[row_idx]
                 model_type = g.col_names[col_idx]
-                sched_val = model_type_to_sched[model_type]
                 
+                # For adversarial models, we find the baseline from the corresponding
+                # scheduled/non-scheduled standard run. RS is compared to the 'no_schedule' std run.
+                sched_val = model_type_to_sched.get(model_type, 'no_schedule')
                 stats = baseline_stats_df[
                     (baseline_stats_df['gc_pos'] == gc_val) & 
                     (baseline_stats_df['scheduling_mode'] == sched_val)
@@ -1410,7 +1736,7 @@ if __name__ == "__main__":
                 hue='conservation', col='model_type', row='metric',
                 palette='viridis', height=3, aspect=1.4, sharey=False, margin_titles=True,
                 col_order=['Adversarial (No Schedule)', 'Adversarial (Scheduled)', 'RandomSmoothing'],
-                row_order=['wIoU', 'Accuracy', 'SaliencyAUC', 'SaliencySNR']
+                row_order=['Accuracy', 'SaliencyAUC', 'SaliencySNR']
             )
             g.set_axis_labels("GC Content (Confounder Strength)", "") # Set X label, but leave Y blank for custom labels
             g.set_titles(col_template="{col_name}", row_template="{row_name}")
