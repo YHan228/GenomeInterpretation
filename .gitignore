@@ -56,3 +56,10 @@ s13059-023-02956-3.pdf
 
 # any png file with "filter_[0-9].png"
 filter_*.png
+
+*.err
+*.out
+*.log
+
+slurm_results/vanilla_run_*
+!slurm_results/vanilla_run_v5*

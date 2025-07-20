@@ -57,17 +57,33 @@ def sample_background(length: int, gc: float) -> np.ndarray:
 
 def random_chunk(length: int) -> np.ndarray:
     """60-bp random chunk with balanced GC ≈ 50 %"""
-    return sample_background(length, 0.50)
+    return sample_background(length, GC_POS)
 
 
-def mutate(chunk: np.ndarray, conservation: float) -> np.ndarray:
-    """Return a new chunk with given conservation level (≈ %identity)"""
+def mutate(chunk: np.ndarray, conservation: float, gc_target: float) -> np.ndarray:
+    """Return a new chunk with given conservation level, with mutations
+    sampled to match the target GC content."""
     mutated_chunk = chunk.copy()
     n_to_mutate = int(len(chunk) * (1.0 - conservation))
     pos_to_mutate = np.random.choice(len(chunk), n_to_mutate, replace=False)
+    
+    # Distribution for sampling new bases
+    p = np.array([(1 - gc_target) / 2, gc_target / 2, gc_target / 2, (1 - gc_target) / 2])
+    
     for pos in pos_to_mutate:
         original_base = mutated_chunk[pos]
-        mutated_chunk[pos] = np.random.choice(np.setdiff1d(ALPH, [original_base]))
+        
+        # Create a temporary probability distribution for the other 3 bases
+        temp_p = p.copy()
+        temp_p[to_ix[original_base]] = 0
+        
+        # If the sum is zero (shouldn't happen with 4 bases), fall back to uniform
+        if temp_p.sum() == 0:
+            mutated_chunk[pos] = np.random.choice(np.setdiff1d(ALPH, [original_base]))
+        else:
+            temp_p /= temp_p.sum() # Normalize to make it a probability distribution
+            mutated_chunk[pos] = np.random.choice(ALPH, p=temp_p)
+
     return mutated_chunk
 
 
@@ -99,22 +115,23 @@ def one_hot_to_seq(one_hot_tensor: torch.Tensor) -> str:
 
 SEQ_LEN = 1000
 CHUNK_LEN = 60
-N_TOTAL = 5000
+N_TOTAL = 10000
 POS_N = N_TOTAL // 2
 NEG_N = N_TOTAL - POS_N
 
 # Define GC content based on the global flag
-GC_POS = 0.55 if WITH_CONFOUNDER else 0.50
+GC_POS = 0.60 if WITH_CONFOUNDER else 0.50
 GC_NEG = 0.50
 
 X, y, masks = [], [], []
 
-master_chunk = random_chunk(CHUNK_LEN)
+# The master chunk for positive examples must also have high GC content.
+master_chunk = sample_background(CHUNK_LEN, gc=GC_POS)
 
 for _ in range(POS_N):
     bg = sample_background(SEQ_LEN, gc=GC_POS)
     conservation = random.uniform(0.6, 0.8)
-    chunk = mutate(master_chunk, conservation)
+    chunk = mutate(master_chunk, conservation, gc_target=GC_POS)
     seq, start = embed(bg, chunk)
     X.append(one_hot(seq))
     y.append(1)
@@ -161,19 +178,69 @@ test_dl = DataLoader(test_ds, batch_size=128)
 class TinyCNN(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv1d(4, 32, 13, padding=6)
-        self.conv2 = nn.Conv1d(32, 64, 7, padding=3)
-        self.conv3 = nn.Conv1d(64, 128, 7, padding=3)
+        # User-specified k1, with sensible defaults for subsequent layers
+        self.k1, self.k2, self.k3 = 30, 3, 3
+
+        # Calculate padding to keep sequence length constant *before* pooling
+        p1 = (self.k1 - 1) // 2
+        # Padding for subsequent layers operating on pooled output
+        p2 = (self.k2 - 1) // 2
+        p3 = (self.k3 - 1) // 2
+
+        # Conv Block 1
+        self.conv1 = nn.Conv1d(4, 32, kernel_size=self.k1, padding=p1)
+        self.bn1 = nn.BatchNorm1d(32)
+        self.dropout1 = nn.Dropout(0.1)
+
+        # Conv Block 2
+        self.conv2 = nn.Conv1d(32, 64, kernel_size=self.k2, padding=p2)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.dropout2 = nn.Dropout(0.1)
+
+        # Conv Block 3
+        self.conv3 = nn.Conv1d(64, 128, kernel_size=self.k3, padding=p3)
+        self.bn3 = nn.BatchNorm1d(128)
+        self.dropout3 = nn.Dropout(0.1)
+
         self.pool = nn.AdaptiveMaxPool1d(1)
-        self.fc   = nn.Linear(128, 1)
+        self.fc_dropout = nn.Dropout(0.5)
+        self.fc = nn.Linear(128, 1)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x)); x = F.max_pool1d(x, 2)
-        x = F.relu(self.conv2(x)); x = F.max_pool1d(x, 2)
-        conv3_out = F.relu(self.conv3(x)); x = F.max_pool1d(conv3_out, 2)
+        # Conv Block 1: Motif scanning
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = torch.exp(x)
+        x = self.dropout1(x)
+        
+        # Localist pooling: Drastically downsample to get motif presence features
+        x = F.max_pool1d(x, 50)
+
+        # Conv Block 2
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+
+        # Conv Block 3
+        conv3_out = self.conv3(x)
+        x = self.bn3(conv3_out)
+        x = F.relu(x)
+        x = self.dropout3(x)
+
+        # FC Layer
         x = self.pool(x).squeeze(-1)
-        logits = self.fc(x) # Return raw logits
+        x = self.fc_dropout(x)
+        logits = self.fc(x)
         return logits.squeeze(-1), conv3_out
+    
+    def receptive_field(self) -> int:
+        """
+        For the localist architecture, the receptive field is conceptually the
+        size of the initial motif scanners (k1), as subsequent layers operate
+        on a heavily downsampled representation of motif presence.
+        """
+        return self.k1
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -185,31 +252,6 @@ bce = nn.BCEWithLogitsLoss()
 # --------------------------------------------------------------------------- #
 # 4. Training functions
 # --------------------------------------------------------------------------- #
-
-class EarlyStopping:
-    """Early stops the training if validation loss doesn't improve after a given patience."""
-    def __init__(self, patience=5, verbose=False, delta=0):
-        self.patience = patience
-        self.verbose = verbose
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-        self.val_loss_min = np.inf
-        self.delta = delta
-
-    def __call__(self, val_loss):
-        score = -val_loss
-        if self.best_score is None:
-            self.best_score = score
-        elif score < self.best_score + self.delta:
-            self.counter += 1
-            if self.verbose:
-                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_score = score
-            self.counter = 0
 
 def validate_epoch(model, loader, loss_fn, dev):
     """Calculates the loss on a validation set."""
@@ -227,9 +269,10 @@ def validate_epoch(model, loader, loss_fn, dev):
     return total_loss / num_batches if num_batches > 0 else 0
 
 
-def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, scheduler, early_stopper, epochs: int = 10, lambda_l1: float = 0.0) -> None:
-    reg_str = f"with L1 reg (λ={lambda_l1:.2E})" if lambda_l1 > 0 else ""
-    print(f"Starting standard training {reg_str}...")
+def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, scheduler, epochs: int = 10, early_stopping_patience: int = 15, early_stopping_min_delta: float = 1e-4) -> None:
+    print(f"Starting standard training with early stopping (patience={early_stopping_patience}, min_delta={early_stopping_min_delta})...")
+    best_val_loss = float('inf')
+    early_stopping_counter = 0
 
     for epoch in range(epochs):
         model.train()
@@ -240,28 +283,34 @@ def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, sca
             optimizer.zero_grad()
             with autocast():
                 logits, conv_out = model(xb)
-                class_loss = loss_fn(logits, yb)
-                if lambda_l1 > 0:
-                    l1_penalty = conv_out.abs().mean()
-                    loss = class_loss + (lambda_l1 * l1_penalty)
-                else:
-                    loss = class_loss
+                loss = loss_fn(logits, yb)
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss.item()
             num_batches += 1
         
         avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
+        if not np.isfinite(avg_train_loss):
+            print(f"  WARNING: NaN or Inf average train loss at epoch {epoch + 1}. Stopping training for this model.")
+            break
+            
         avg_val_loss = validate_epoch(model, val_loader, loss_fn, dev)
 
-        print(f"  Epoch {epoch + 1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        scheduler.step(avg_val_loss)
+        print(f"  Epoch {epoch + 1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, LR: {scheduler.optimizer.param_groups[0]['lr']:.2E}")
         
-        scheduler.step()
-        early_stopper(avg_val_loss)
-        if early_stopper.early_stop:
-            print("Early stopping triggered.")
+        if (best_val_loss - avg_val_loss) > early_stopping_min_delta:
+            best_val_loss = avg_val_loss
+            early_stopping_counter = 0
+        else:
+            early_stopping_counter += 1
+        
+        if early_stopping_counter >= early_stopping_patience:
+            print(f"  -> Early stopping at epoch {epoch + 1} due to no improvement for {early_stopping_patience} epochs.")
             break
 
 
@@ -303,13 +352,15 @@ def generate_hotflip_examples(model, xb, yb, loss_fn, flip_fraction: float,
     return adv_xb
 
 
-def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, scheduler, early_stopper,
-                  max_flip_fraction: float, epochs: int = 10, use_scheduling: bool = True, lambda_l1: float = 0.0) -> None:
+def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, scheduler,
+                  max_flip_fraction: float, epochs: int = 10, use_scheduling: bool = True, early_stopping_patience: int = 25, early_stopping_min_delta: float = 1e-4) -> None:
     
     scheduling_str = "ON" if use_scheduling else "OFF"
-    reg_str = f"with L1 reg (λ={lambda_l1:.2E})" if lambda_l1 > 0 else ""
-    print(f"Starting HotFlip training with max_flip_fraction = {max_flip_fraction:.4f}, Scheduling: {scheduling_str} {reg_str}...")
+    print(f"Starting HotFlip training with max_flip_fraction = {max_flip_fraction:.4f}, Scheduling: {scheduling_str}...")
     
+    previous_val_loss = float('inf')
+    early_stopping_counter = 0
+
     for epoch in range(epochs):
         
         max_flips = int(max_flip_fraction * SEQ_LEN)
@@ -330,14 +381,11 @@ def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scal
             optimizer.zero_grad()
             with autocast():
                 logits_adv, conv_out_adv = model(adv_xb)
-                class_loss = loss_fn(logits_adv, yb)
-                if lambda_l1 > 0:
-                    l1_penalty = conv_out_adv.abs().mean()
-                    loss_adv = class_loss + (lambda_l1 * l1_penalty)
-                else:
-                    loss_adv = class_loss
+                loss_adv = loss_fn(logits_adv, yb)
 
             scaler.scale(loss_adv).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss_adv.item()
@@ -346,12 +394,26 @@ def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scal
         avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
         avg_val_loss = validate_epoch(model, val_loader, loss_fn, dev)
         
-        print(f"  Epoch {epoch + 1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Epsilon: {current_flip_fraction:.4f}")
+        if use_scheduling:
+            scheduler.best = previous_val_loss
+        
+        scheduler.step(avg_val_loss)
 
-        scheduler.step()
-        early_stopper(avg_val_loss)
-        if early_stopper.early_stop:
-            print("Early stopping triggered.")
+        print(f"  Epoch {epoch + 1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Epsilon: {current_flip_fraction:.4f}, LR: {scheduler.optimizer.param_groups[0]['lr']:.2E}")
+
+        if not np.isfinite(avg_train_loss):
+            print(f"  WARNING: NaN or Inf average train loss at epoch {epoch + 1}. Stopping training for this model.")
+            break
+
+        if (previous_val_loss - avg_val_loss) > early_stopping_min_delta:
+            early_stopping_counter = 0
+        else:
+            early_stopping_counter += 1
+        
+        previous_val_loss = avg_val_loss
+
+        if early_stopping_counter >= early_stopping_patience:
+            print(f"  -> Early stopping at epoch {epoch + 1} due to no improvement for {early_stopping_patience} consecutive epochs.")
             break
 
 
@@ -359,9 +421,77 @@ def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scal
 # 5. Attribution-based evaluation (Integrated Gradients & Grad-CAM)
 # --------------------------------------------------------------------------- #
 
+def find_adversarial_baseline_pgd(model, xb: torch.Tensor, yb: torch.Tensor, dev: torch.device,
+                                  num_iter: int = 20, epsilon: float = 0.1, step_size: float = 0.01):
+    """
+    Finds a baseline for IG using PGD to find a nearby adversarial example
+    that flips the model's prediction. Returns the baseline and a stats dict.
+    """
+    adv_xb = xb.clone().detach()
+    stats = {
+        'success': False,
+        'initial_logit': 0.0,
+        'final_logit': 0.0,
+        'found_at_iter': num_iter,
+        'initial_prediction_correct': False
+    }
+
+    with torch.no_grad(), autocast():
+        initial_logits, _ = model(adv_xb)
+        initial_pred_class = (initial_logits > 0).float()
+        stats['initial_logit'] = initial_logits.item()
+        stats['final_logit'] = initial_logits.item() # Default final logit
+
+    is_correct = initial_pred_class.item() == yb.item()
+    stats['initial_prediction_correct'] = is_correct
+
+    # We only run PGD if the initial prediction for a positive example is correct.
+    if not is_correct or yb.item() == 0:
+        return torch.zeros_like(xb, device=dev), stats
+
+    loss_fn = nn.BCEWithLogitsLoss()
+    
+    # Use a more stable step size for sign-based PGD
+    step_size = epsilon / 10.0
+
+    for i in range(num_iter):
+        adv_xb.requires_grad = True
+        with autocast():
+            logits, _ = model(adv_xb)
+            loss = loss_fn(logits, yb.expand_as(logits))
+        
+        model.zero_grad()
+        loss.backward()
+        
+        with torch.no_grad():
+            grad = adv_xb.grad.data
+            # Use sign() for more stable PGD updates
+            adv_xb = adv_xb + step_size * grad.sign()
+            
+            delta = adv_xb - xb
+            delta = torch.clamp(delta, -epsilon, epsilon)
+            adv_xb = torch.clamp(xb + delta, 0, 1)
+
+            current_logits, _ = model(adv_xb)
+            current_pred_class = (current_logits > 0).float()
+            
+            if current_pred_class.item() != initial_pred_class.item():
+                stats['success'] = True
+                stats['final_logit'] = current_logits.item()
+                stats['found_at_iter'] = i + 1
+                return adv_xb.detach(), stats
+    
+    # If no flip was found, final logit is the last one computed
+    with torch.no_grad():
+        final_logits, _ = model(adv_xb)
+        stats['final_logit'] = final_logits.item()
+
+    return torch.zeros_like(xb, device=dev), stats
+
+
 def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = True):
     print(f"Evaluating model: {model_name}")
-    SAMPLE_N = 300
+    SAMPLE_N = 100
     ANALYSIS_CHUNK_LEN = 60  # assumed window size
 
     # -- accuracy ----------------------------------------------------------------
@@ -403,21 +533,37 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
                       size=sample_n_actual,
                       replace=False)
 
-    baseline = torch.full((1, 4, SEQ_LEN), 0.25, device=dev)
     results = []
+    pgd_results = []
     for idx in idxs:
-        xb, _, mask = test_ds[idx]
+        xb, y_scalar, mask = test_ds[idx]
         xb = xb.unsqueeze(0).to(dev)
-        attributions = (
-            ig.attribute(xb, baselines=baseline, target=0)
-              .abs()
-              .sum(1)
-              .squeeze(0)
-              .cpu()
-              .numpy()
-        )
+        yb = torch.tensor([y_scalar], device=dev, dtype=torch.float)
 
-        # 1. contiguous wIoU
+        # Two-stage baseline strategy:
+        # 1. Try to find a decision-boundary point using PGD.
+        pgd_baseline, pgd_stat = find_adversarial_baseline_pgd(model, xb, yb, dev)
+        pgd_results.append(pgd_stat)
+
+        # 2. If PGD succeeds, use the adversarial example as the baseline.
+        #    If it fails, fall back to the sequence's own nucleotide composition.
+        if pgd_stat['success']:
+            baseline = pgd_baseline
+        else:
+            proportions = xb.mean(dim=2, keepdim=True)
+            baseline = proportions.expand_as(xb)
+
+        raw_attributions = ig.attribute(xb, baselines=baseline, target=0)
+        
+        # Apply the gradient correction from Majdandzic et al., Genome Biology 2023.
+        # This subtracts the mean attribution across all nucleotides at each position.
+        corrected_attributions = raw_attributions - raw_attributions.mean(dim=1, keepdim=True)
+        
+        # Calculate final contribution scores using the corrected attributions,
+        # taking the absolute value after projection as is standard for IG.
+        attributions = np.abs((corrected_attributions * xb).sum(1).squeeze(0).cpu().numpy())
+
+        # 1. contiguous Overlap
         window_sums = np.convolve(attributions,
                                   np.ones(ANALYSIS_CHUNK_LEN),
                                   mode='valid')
@@ -436,10 +582,10 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
         # Efficiently calculate AUC: probability that a random inside score is > a random outside score
         saliency_auc = (inside_scores[:, None] > outside_scores[None, :]).mean()
 
-        # 3. Saliency Signal-to-Noise Ratio
-        mean_inside = inside_scores.mean()
-        mean_outside = outside_scores.mean()
-        saliency_snr = mean_inside / (mean_outside + 1e-9)
+        # 3. Saliency Signal-to-Noise Ratio (fraction of energy in motif)
+        sum_sq_inside = np.sum(inside_scores**2)
+        sum_sq_total = np.sum(attributions**2)
+        saliency_snr = sum_sq_inside / (sum_sq_total + 1e-9)
 
         results.append(
             dict(iou_cont=iou_cont,
@@ -459,7 +605,7 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
     mean_iou_cont = np.mean([r['iou_cont'] for r in results])
     mean_saliency_auc = np.mean([r['saliency_auc'] for r in results])
     mean_saliency_snr = np.mean([r['saliency_snr'] for r in results])
-    print(f"Mean wIoU : {mean_iou_cont:.3f} on {len(results)} positive samples")
+    print(f"Mean Overlap : {mean_iou_cont:.3f} on {len(results)} positive samples")
     print(f"Mean Saliency AUC: {mean_saliency_auc:.3f}")
     print(f"Mean Saliency SNR: {mean_saliency_snr:.3f}")
 
@@ -469,7 +615,7 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
     # -- plotting ----------------------------------------------------------------
     fig, axs = plt.subplots(3, 2, figsize=(15, 12))
     fig.suptitle(
-        f'IG scores vs. position ({model_name.title()}, sorted by wIoU)'
+        f'IG scores vs. position ({model_name.title()}, sorted by Overlap)'
     )
     n_res = len(results)
     mid1, mid2 = n_res // 2 - 1, n_res // 2
@@ -485,7 +631,7 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
                 label='IG score',
                 color='black',
                 linewidth=0.7)
-        ax.set_title(f"{title}\nwIoU={data['iou_cont']:.3f}, AUC={data['saliency_auc']:.3f}, SNR={data['saliency_snr']:.2f}")
+        ax.set_title(f"{title}\nOverlap={data['iou_cont']:.3f}, AUC={data['saliency_auc']:.3f}, SNR={data['saliency_snr']:.2f}")
         ax.set_xlabel("Position")
         ax.set_ylabel("IG score")
         ax.grid(True, ls='--', alpha=0.6)
@@ -520,7 +666,7 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
     fig_dist.suptitle(f'Evaluation Metric Distributions ({model_name.title()})')
 
     axs_dist[0].hist(wious, bins=20, alpha=0.75)
-    axs_dist[0].set_title('Windowed IoU (wIoU)')
+    axs_dist[0].set_title('Overlap')
     axs_dist[0].set_xlabel('Score')
     axs_dist[0].set_ylabel('Frequency')
     axs_dist[0].grid(True, ls='--', alpha=0.6)
@@ -530,7 +676,7 @@ def evaluate_model(model, model_name: str, test_ds, dev, produce_plots: bool = T
     axs_dist[1].set_xlabel('Score')
     axs_dist[1].grid(True, ls='--', alpha=0.6)
 
-    axs_dist[2].hist(saliency_snrs, bins=20, alpha=0.75, range=(0, max(np.percentile(saliency_snrs, 99), 10)))
+    axs_dist[2].hist(saliency_snrs, bins=20, alpha=0.75, range=(0, 1.0))
     axs_dist[2].set_title('Saliency SNR')
     axs_dist[2].set_xlabel('Score')
     axs_dist[2].grid(True, ls='--', alpha=0.6)
@@ -680,16 +826,15 @@ def run_single_experiment(seed: int, epsilons_to_test: List[float], main_train_d
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     bce = nn.BCEWithLogitsLoss()
     scaler = GradScaler()
-    epochs = 30 # Increased epochs for better convergence with scheduler
+    epochs = 100 # Increased epochs for better convergence with scheduler
 
     # --- Standard model ---
     set_seeds(seed)
     standard_model = TinyCNN().to(dev)
-    opt_standard = torch.optim.Adam(standard_model.parameters(), lr=1e-3)
-    std_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_standard, T_max=epochs)
-    std_early_stopper = EarlyStopping(patience=5, verbose=True)
+    opt_standard = torch.optim.AdamW(standard_model.parameters(), lr=3e-4, weight_decay=1e-6)
+    std_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_standard, 'min', factor=0.5, patience=8, verbose=True)
     
-    train_standard(standard_model, train_dl, val_dl, bce, opt_standard, dev, scaler, std_scheduler, std_early_stopper, epochs=epochs)
+    train_standard(standard_model, train_dl, val_dl, bce, opt_standard, dev, scaler, std_scheduler, epochs=epochs)
     std_wiou, std_acc, std_auc, std_snr = evaluate_model(standard_model,
                                        f"standard_seed{seed}",
                                        test_ds,
@@ -701,9 +846,8 @@ def run_single_experiment(seed: int, epsilons_to_test: List[float], main_train_d
     for eps in epsilons_to_test:
         set_seeds(seed)
         mdl = TinyCNN().to(dev)
-        opt = torch.optim.Adam(mdl.parameters(), lr=1e-3)
-        rob_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-        rob_early_stopper = EarlyStopping(patience=5, verbose=True)
+        opt = torch.optim.AdamW(mdl.parameters(), lr=3e-4, weight_decay=1e-6)
+        rob_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', factor=0.5, patience=8, verbose=True)
 
         if eps == 0:
             print("Skipping HotFlip for eps=0, copying standard model results.")
@@ -713,7 +857,7 @@ def run_single_experiment(seed: int, epsilons_to_test: List[float], main_train_d
             robust_snrs.append(std_snr)
             continue
             
-        train_hotflip(mdl, train_dl, val_dl, bce, opt, dev, scaler, rob_scheduler, rob_early_stopper, 
+        train_hotflip(mdl, train_dl, val_dl, bce, opt, dev, scaler, rob_scheduler, 
                       max_flip_fraction=eps, epochs=epochs, use_scheduling=True)
         
         k_flips_for_name = int(eps * SEQ_LEN)
@@ -739,12 +883,12 @@ if __name__ == "__main__":
     # Generate the single, large dataset for all experiments
     print(f"--- Generating a single dataset of size {N_TOTAL} ---")
     set_seeds(42) # Use a fixed seed for dataset generation
-    master_chunk = random_chunk(CHUNK_LEN)
+    master_chunk = sample_background(CHUNK_LEN, gc=GC_POS)
     X, y, masks = [], [], []
     for _ in range(POS_N):
         bg = sample_background(SEQ_LEN, gc=GC_POS)
         conservation = random.uniform(0.6, 0.9)
-        chunk = mutate(master_chunk, conservation)
+        chunk = mutate(master_chunk, conservation, gc_target=GC_POS)
         seq, start = embed(bg, chunk)
         X.append(one_hot(seq)); y.append(1)
         m = np.zeros(SEQ_LEN, dtype=bool); m[start:start + CHUNK_LEN] = True; masks.append(m)
@@ -776,26 +920,24 @@ if __name__ == "__main__":
 
     # --- Standard model for visualization ---
     viz_model = TinyCNN().to(device)
-    viz_opt = torch.optim.Adam(viz_model.parameters(), lr=1e-3)
+    viz_opt = torch.optim.AdamW(viz_model.parameters(), lr=3e-4, weight_decay=1e-6)
     viz_scaler = GradScaler()
-    epochs_viz = 30
-    viz_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(viz_opt, T_max=epochs_viz)
-    viz_early_stopper = EarlyStopping(patience=5, verbose=True)
+    epochs_viz = 100
+    viz_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(viz_opt, 'min', factor=0.5, patience=8, verbose=True)
 
-    train_standard(viz_model, viz_train_dl, viz_val_dl, bce, viz_opt, device, viz_scaler, viz_scheduler, viz_early_stopper, epochs=epochs_viz)
+    train_standard(viz_model, viz_train_dl, viz_val_dl, bce, viz_opt, device, viz_scaler, viz_scheduler, epochs=epochs_viz)
     evaluate_model(viz_model, "standard_baseline", main_test_ds, device, True)
     
     # --- Adversarial Analysis Section ---
     print("\n--- Training a single HotFlip model for analysis ---")
     set_seeds(0)
     hotflip_model_for_analysis = TinyCNN().to(device)
-    hotflip_opt = torch.optim.Adam(hotflip_model_for_analysis.parameters(), lr=1e-3)
+    hotflip_opt = torch.optim.AdamW(hotflip_model_for_analysis.parameters(), lr=3e-4, weight_decay=1e-6)
     hotflip_scaler = GradScaler()
-    hotflip_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(hotflip_opt, T_max=epochs_viz)
-    hotflip_early_stopper = EarlyStopping(patience=5, verbose=True)
+    hotflip_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(hotflip_opt, 'min', factor=0.5, patience=8, verbose=True)
 
     analysis_flip_fraction = 0.01 # Using 1% flips (k=10)
-    train_hotflip(hotflip_model_for_analysis, viz_train_dl, viz_val_dl, bce, hotflip_opt, device, hotflip_scaler, hotflip_scheduler, hotflip_early_stopper, max_flip_fraction=analysis_flip_fraction, epochs=epochs_viz, use_scheduling=True)
+    train_hotflip(hotflip_model_for_analysis, viz_train_dl, viz_val_dl, bce, hotflip_opt, device, hotflip_scaler, hotflip_scheduler, max_flip_fraction=analysis_flip_fraction, epochs=epochs_viz, use_scheduling=True)
     analyze_adversarial_examples(hotflip_model_for_analysis, main_test_ds, device, bce, flip_fraction=analysis_flip_fraction)
     evaluate_model(hotflip_model_for_analysis, "hotflip_baseline", main_test_ds, device, True)
 
@@ -843,7 +985,7 @@ if __name__ == "__main__":
     rob_snr_mean = rob_snr_arr.mean(axis=0)
     rob_snr_std = rob_snr_arr.std(axis=0)
 
-    # plot wIoU vs eps
+    # plot Overlap vs eps
     plt.figure(figsize=(12, 8))
     plt.plot(EPSILONS, rob_mean, marker='o', label='Robust mean')
     plt.fill_between(EPSILONS, rob_mean - rob_std, rob_mean + rob_std, alpha=0.2)
@@ -855,12 +997,12 @@ if __name__ == "__main__":
                      color='r', alpha=0.1)
     plt.xscale('log')
     plt.xlabel('Epsilon (Fraction of Sequence Flipped)')
-    plt.ylabel('Mean wIoU')
-    plt.title('Epsilon vs interpretability (10 seeds)')
+    plt.ylabel('Mean Overlap')
+    plt.title('Epsilon vs Overlap (10 seeds)')
     plt.grid(True, which='both', ls='--')
     plt.legend()
-    plt.savefig("multi_seed_fgsm_vs_wiou.png")
-    print("Saved plot → multi_seed_fgsm_vs_wiou.png")
+    plt.savefig("multi_seed_fgsm_vs_overlap.png")
+    print("Saved plot → multi_seed_fgsm_vs_overlap.png")
 
     # plot accuracy vs eps
     plt.figure(figsize=(12, 8))
