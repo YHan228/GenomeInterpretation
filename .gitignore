@@ -63,3 +63,9 @@ filter_*.png
 
 slurm_results/vanilla_run_*
 !slurm_results/vanilla_run_v5*
+
+koo*
+
+optuna_results/
+optuna_results_ver1/
+slurm_output/

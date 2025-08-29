@@ -4,26 +4,28 @@ training on model interpretability. For a detailed overview, see the file
 `docu_toy_slurm.md`.
 
 Author: Yichen Han, 2025-06-29
-
 --------------------------------------------------------------------------------
-CHANGELOG (2025-07-16):
-  - Model Architecture (`TinyCNN`):
-    - Unified architecture to a single "localist" design.
-    - The model now uses a single `MaxPool1d(50)` after the first conv block.
-  - Experiment Design:
-    - Added "Direct HotFlip" as a new adversarial training mode.
-    - The experiment now compares: Standard vs. Iterative HotFlip vs. Direct HotFlip.
-  - Hyperparameters & Evaluation:
-    - Added `GC_pos = 0.5` for a no-confounder baseline.
-    - Increased evaluation sample size from 50 to 100 for more stable metrics.
-  - Monitoring:
-    - Added TensorBoard logging for NaN losses and early stopping.
-    - Added lightweight, periodic monitoring of model-level "effect sizes"
-      (logit-perturbation based) for both the GC confounder and the causal motif,
-      allowing direct observation of how training shifts model reliance.
-  - Interpretability Metric (SaliencyAUC): Refined the primary interpretability
-    metric to be `Δ(RootSkill)`, a concave and orientation-aware metric that better
-    rewards the "escape from randomness" and penalizes misoriented saliency maps.
+CHANGELOG (2025-08-11): Optuna HPO Integration and Utilities
+  - Added Optuna-based HPO with multi-objective (Val Accuracy, Saliency AUC) via NSGA-II;
+    optional scalar objective for TPE.
+  - Pruning hooks (validation loss) across all regimes; no change to early stopping.
+  - New CLI flags: --tune, --study-name, --storage, --sampler, --pruner, --n-trials,
+    --max-epochs, --num-seeds-per-trial, --mode, --save-trial-artifacts, --artifacts-dir,
+    --reval-trial, --reval-seeds, --smoke-test.
+  - Accuracy constraint handled post-hoc (filter Acc ≥ 0.90, maximize Saliency AUC).
+  - Parallel/distributed via shared Optuna storage (SQLite/PostgreSQL/MySQL) with n_jobs=1 per worker.
+  - Results exported to optuna_results/{study_name}/trials.csv and summary.json.
+  - Re-evaluation utility to retrain chosen trial across K seeds and report mean±SE.
+
+SLURM HPO examples (parallel workers share the same study and storage):
+  # Single-worker smoke test (SQLite)
+  # export OPTUNA_STORAGE="sqlite:////scratch/$USER/optuna.db"
+  # python toy_slurm.py --tune --study-name tinycnn_dev --n-trials 10 --mode standard --output_dir ./hpo_out
+
+  # 20-way parallel on cluster (PostgreSQL)
+  # export OPTUNA_STORAGE="postgresql+psycopg2://USER:PASS@DBHOST:5432/optuna"
+  # sbatch --array=1-20 --gres=gpu:1 -p gpu --mem=20G -t 2:00:00 \
+  #   --wrap='python toy_slurm.py --tune --study-name tinycnn_gc055 --n-trials 400 --mode standard --output_dir ./hpo_out'
 --------------------------------------------------------------------------------
 """
 
@@ -34,6 +36,7 @@ import random
 import string
 import argparse
 import sys
+import json
 from typing import List, Tuple
 
 import matplotlib.pyplot as plt
@@ -50,6 +53,15 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.ticker as ticker
 from scipy.stats import norm
+from matplotlib.colors import ListedColormap
+
+# Optional Optuna imports (guarded)
+try:
+    import optuna
+    from optuna.pruners import HyperbandPruner
+    from optuna.samplers import NSGAIISampler, TPESampler
+except Exception:
+    optuna = None  # Will check at runtime if tuning is requested
 
 try:
     import logomaker
@@ -80,51 +92,162 @@ os.makedirs(DATASET_CACHE_DIR, exist_ok=True)
 DEFAULT_BATCH_SIZE = 512  # fits comfortably on V100 / T4
 DEFAULT_EVAL_BATCH_SIZE = 1024  # Larger batch for evaluation
 
-class GPUPrefetchDataLoader:
-    """Wrapper to prefetch data to GPU asynchronously."""
-    def __init__(self, dataloader, device):
-        self.dataloader = dataloader
-        self.device = device
-        
-    def __iter__(self):
-        stream = torch.cuda.Stream() if torch.cuda.is_available() else None
-        first = True
-        
-        for next_batch in self.dataloader:
-            if stream:
-                with torch.cuda.stream(stream):
-                    # Move next batch to GPU asynchronously
-                    next_batch_gpu = []
-                    for item in next_batch:
-                        if torch.is_tensor(item):
-                            next_batch_gpu.append(item.to(self.device, non_blocking=True))
-                        else:
-                            next_batch_gpu.append(item)
+# Centralized configuration (edit here instead of passing many flags)
+CONFIG = {
+    'paths': {
+        'output_dir': './results',
+        'artifacts_dir': './optuna_artifacts',
+    },
+    'training': {
+        'epochs': 50,
+        'train_batch_size': DEFAULT_BATCH_SIZE,
+        'num_workers': 2,
+        'deterministic': False,
+    },
+    'hpo': {
+        'study_name': 'toycnn_default',
+        'storage': os.environ.get('OPTUNA_STORAGE', 'sqlite:///./optuna.db'),
+        'sampler': 'nsga2',        # nsga2 | tpe
+        'pruner': 'hyperband',     # hyperband | median | none
+        'n_trials': 100,
+        'max_epochs': 40,
+        'num_seeds_per_trial': 1,
+        'mode': 'standard',        # standard | random_smoothing | hotflip | direct_hotflip
+        'save_trial_artifacts': False,
+    }
+}
+
+# TensorBoard control: disabled by default for HPO to reduce I/O
+TB_ENABLED = False
+
+class NullSummaryWriter:
+    def add_scalar(self, *args, **kwargs):
+        return
+    def add_hparams(self, *args, **kwargs):
+        return
+    def add_figure(self, *args, **kwargs):
+        return
+    def flush(self):
+        return
+    def close(self):
+        return
+
+def make_writer(log_dir: str):
+    if TB_ENABLED:
+        try:
+            return SummaryWriter(log_dir=log_dir)
+        except Exception:
+            return NullSummaryWriter()
+    return NullSummaryWriter()
+
+# --------------------------------------------------------------------------- #
+# Optuna Search Space (centralized for easy editing)
+# --------------------------------------------------------------------------- #
+
+SEARCH_SPACE = {
+    'arch': {
+        # Compact targeted grids for sample-efficient HPO
+        'k1': [7, 15, 21, 27, 33, 39],
+        'k2': [3, 7, 11],
+        'k3': [3, 7, 11],
+        'c1': [32, 64, 96],
+        'c2': [64, 128, 160],
+        'c3': [128, 160, 192],
+        'pool_w': [1, 10, 50, 100],
+        'act1': ["exp", "relu"],
+        'drop_conv1': {'low': 0.0, 'high': 0.4},
+        'drop_conv2': {'low': 0.0, 'high': 0.4},
+        'drop_conv3': {'low': 0.0, 'high': 0.4},
+        'drop_fc':    {'low': 0.2, 'high': 0.7},
+    },
+    'opt': {
+        'optimizer': ["adamw"],
+        'lr': {'low': 1e-4, 'high': 3e-3, 'log': True},
+        'weight_decay': {'low': 1e-8, 'high': 1e-2, 'log': True},
+        'train_batch_size': [512],
+        'grad_clip': [1.0, 5.0],
+    },
+    'regimes': {
+        'random_smoothing': {
+            'epsilon': {'low': 1e-3, 'high': 0.5, 'log': True}
+        },
+        'gaussian_smoothing': {
+            'sigma2': {'low': 1e-5, 'high': 0.1, 'log': True}
+        },
+        'hotflip': {
+            'max_flip_fraction': {'low': 1e-3, 'high': 0.2, 'log': True}
+        },
+        'direct_hotflip': {
+            'max_flip_fraction': {'low': 1e-3, 'high': 0.2, 'log': True}
+        }
+    }
+}
+
+
+def _find_best_standard_params_for_dataset(gc_pos: float, conservation: float, acc_threshold: float = 0.995) -> dict:
+    """
+    Locate the best standard-model hyperparameters for a given dataset (gc_pos, conservation)
+    by scanning optuna_results/*_mode_standard folders. Selection rule: Acc >= acc_threshold,
+    then maximize Saliency AUC; otherwise best Acc with SaAUC tie-break.
+    Returns a dictionary with model/optimizer hyperparameters if found, else {}.
+    """
+    root = 'optuna_results'
+    if not os.path.isdir(root):
+        return {}
+    target_suffix = f"_gc{gc_pos:.3f}_cons{conservation:.2f}_mode_standard"
+    candidates = []
+    try:
+        for name in os.listdir(root):
+            if not name.endswith(target_suffix):
+                continue
+            trials_path = os.path.join(root, name, 'trials.csv')
+            if os.path.exists(trials_path):
+                candidates.append(trials_path)
+    except Exception:
+        pass
+    if not candidates:
+        return {}
+    # Prefer most recently modified trials.csv
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    import pandas as pd  # local import to avoid polluting module import time
+    best_row = None
+    for p in candidates:
+        try:
+            df = pd.read_csv(p)
+            # Normalize columns
+            acc_col = next((c for c in df.columns if str(c).lower().startswith('values_0')), None)
+            auc_col = next((c for c in df.columns if str(c).lower().startswith('values_1')), None)
+            if acc_col is None and 'val_acc' in df.columns:
+                acc_col = 'val_acc'
+            if auc_col is None and 'saliency_auc' in df.columns:
+                auc_col = 'saliency_auc'
+            if acc_col is None or auc_col is None:
+                continue
+            df = df.copy()
+            df['val_acc'] = df[acc_col]
+            df['saliency_auc'] = df[auc_col]
+            if 'state' in df.columns:
+                df = df[df['state'] == 'COMPLETE']
+            if df.empty:
+                continue
+            eligible = df[df['val_acc'] >= acc_threshold]
+            if not eligible.empty:
+                row = eligible.sort_values(['saliency_auc', 'val_acc'], ascending=[False, False]).iloc[0]
             else:
-                # CPU fallback
-                next_batch_gpu = []
-                for item in next_batch:
-                    if torch.is_tensor(item):
-                        next_batch_gpu.append(item.to(self.device))
-                    else:
-                        next_batch_gpu.append(item)
-            
-            if not first:
-                yield batch_gpu
-            else:
-                first = False
-                
-            if stream:
-                # Synchronize the stream
-                torch.cuda.current_stream().wait_stream(stream)
-            batch_gpu = next_batch_gpu
-        
-        # Yield the last batch
-        if not first:
-            yield batch_gpu
-    
-    def __len__(self):
-        return len(self.dataloader)
+                row = df.sort_values(['val_acc', 'saliency_auc'], ascending=[False, False]).iloc[0]
+            best_row = row
+            break
+        except Exception:
+            continue
+    if best_row is None:
+        return {}
+    # Extract params_* columns
+    params = {}
+    for col in best_row.index:
+        if isinstance(col, str) and col.startswith('params_'):
+            key = col[len('params_'):]
+            params[key] = best_row[col]
+    return params
 
 def set_seeds(seed_value: int = 42, deterministic: bool = False) -> None:
     np.random.seed(seed_value)
@@ -450,45 +573,74 @@ class TinyCNNv0(nn.Module):
 
 
 class TinyCNN(nn.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        k1: int = 30,
+        k2: int = 3,
+        k3: int = 3,
+        c1: int = 32,
+        c2: int = 64,
+        c3: int = 128,
+        pool_w: int = 50,
+        drop_conv1: float = 0.1,
+        drop_conv2: float = 0.1,
+        drop_conv3: float = 0.1,
+        drop_fc: float = 0.5,
+        act1: str = "exp",
+    ):
         super().__init__()
-        # User-specified k1, with sensible defaults for subsequent layers
-        self.k1, self.k2, self.k3 = 30, 3, 3
+        # Store hyperparameters
+        self.k1, self.k2, self.k3 = int(k1), int(k2), int(k3)
+        self.c1, self.c2, self.c3 = int(c1), int(c2), int(c3)
+        self.pool_w = int(pool_w)
+        self.drop_conv1 = float(drop_conv1)
+        self.drop_conv2 = float(drop_conv2)
+        self.drop_conv3 = float(drop_conv3)
+        self.drop_fc = float(drop_fc)
+        self.act1 = act1
 
         # Calculate padding to keep sequence length constant *before* pooling
         p1 = (self.k1 - 1) // 2
-        # Padding for subsequent layers operating on pooled output
         p2 = (self.k2 - 1) // 2
         p3 = (self.k3 - 1) // 2
 
         # Conv Block 1
-        self.conv1 = nn.Conv1d(4, 32, kernel_size=self.k1, padding=p1)
-        self.bn1 = nn.BatchNorm1d(32)
-        self.dropout1 = nn.Dropout(0.1)
+        self.conv1 = nn.Conv1d(4, self.c1, kernel_size=self.k1, padding=p1)
+        self.bn1 = nn.BatchNorm1d(self.c1)
+        self.dropout1 = nn.Dropout(self.drop_conv1)
 
         # Conv Block 2
-        self.conv2 = nn.Conv1d(32, 64, kernel_size=self.k2, padding=p2)
-        self.bn2 = nn.BatchNorm1d(64)
-        self.dropout2 = nn.Dropout(0.1)
+        self.conv2 = nn.Conv1d(self.c1, self.c2, kernel_size=self.k2, padding=p2)
+        self.bn2 = nn.BatchNorm1d(self.c2)
+        self.dropout2 = nn.Dropout(self.drop_conv2)
 
         # Conv Block 3
-        self.conv3 = nn.Conv1d(64, 128, kernel_size=self.k3, padding=p3)
-        self.bn3 = nn.BatchNorm1d(128)
-        self.dropout3 = nn.Dropout(0.1)
+        self.conv3 = nn.Conv1d(self.c2, self.c3, kernel_size=self.k3, padding=p3)
+        self.bn3 = nn.BatchNorm1d(self.c3)
+        self.dropout3 = nn.Dropout(self.drop_conv3)
 
         self.pool = nn.AdaptiveMaxPool1d(1)
-        self.fc_dropout = nn.Dropout(0.5)
-        self.fc = nn.Linear(128, 1)
+        self.fc_dropout = nn.Dropout(self.drop_fc)
+        self.fc = nn.Linear(self.c3, 1)
+
+    def _act1(self, x: torch.Tensor) -> torch.Tensor:
+        if self.act1 == "exp":
+            return torch.exp(x)
+        if self.act1 == "softplus":
+            return F.softplus(x)
+        if self.act1 == "gelu":
+            return F.gelu(x)
+        return F.relu(x)
 
     def forward(self, x):
         # Conv Block 1: Motif scanning
         x = self.conv1(x)
         x = self.bn1(x)
-        x = torch.exp(x)
+        x = self._act1(x)
         x = self.dropout1(x)
         
         # Localist pooling: Drastically downsample to get motif presence features
-        x = F.max_pool1d(x, 50)
+        x = F.max_pool1d(x, self.pool_w)
 
         # Conv Block 2
         x = self.conv2(x)
@@ -509,11 +661,6 @@ class TinyCNN(nn.Module):
         return logits.squeeze(-1), conv3_out
     
     def receptive_field(self) -> int:
-        """
-        For the localist architecture, the receptive field is conceptually the
-        size of the initial motif scanners (k1), as subsequent layers operate
-        on a heavily downsampled representation of motif presence.
-        """
         return self.k1
 
 # Backwards alias so downstream imports remain valid
@@ -538,8 +685,21 @@ def validate_epoch(model, loader, loss_fn, dev):
             num_batches += 1
     return total_loss / num_batches if num_batches > 0 else 0
 
+def compute_validation_accuracy(model, loader, dev) -> float:
+    model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for xb, yb, _ in loader:
+            xb, yb = xb.to(dev), yb.to(dev)
+            with autocast():
+                logits, _ = model(xb)
+            preds = (torch.sigmoid(logits) > 0.5).float()
+            correct += (preds == yb).sum().item()
+            total += len(yb)
+    return correct / total if total else 0.0
 
-def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, writer, scheduler, epochs: int = 10, early_stopping_patience: int = 15, early_stopping_min_delta: float = 1e-4) -> None:
+
+def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, writer, scheduler, epochs: int = 10, early_stopping_patience: int = 15, early_stopping_min_delta: float = 1e-4, trial=None, grad_clip: float = 5.0) -> None:
     print(f"Starting standard training with early stopping (patience={early_stopping_patience}, min_delta={early_stopping_min_delta})...")
     best_val_loss = float('inf')
     early_stopping_counter = 0
@@ -557,7 +717,8 @@ def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, sca
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss.item()
@@ -571,11 +732,13 @@ def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, sca
             break
             
         avg_val_loss = validate_epoch(model, val_loader, loss_fn, dev)
+        val_acc = compute_validation_accuracy(model, val_loader, dev)
 
         # Step scheduler first, then log the potentially new LR
         scheduler.step(avg_val_loss)
         writer.add_scalar('Loss/train', avg_train_loss, epoch)
         writer.add_scalar('Loss/validation', avg_val_loss, epoch)
+        writer.add_scalar('Accuracy/validation', val_acc, epoch)
         writer.add_scalar('LR/train', scheduler.optimizer.param_groups[0]['lr'], epoch)
         
         # Compute and log effect sizes every 5 epochs (to avoid bottlenecks)
@@ -588,6 +751,15 @@ def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, sca
             log_gpu_stats("    ")
         else:
             print(f"  Epoch {epoch + 1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        
+        # Optuna pruning hook
+        if trial is not None and optuna is not None:
+            try:
+                trial.report(float(avg_val_loss), step=epoch)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+            except Exception:
+                pass
         
         # Check for improvement
         if (best_val_loss - avg_val_loss) > early_stopping_min_delta:
@@ -630,7 +802,7 @@ def generate_smoothed_batch(xb: torch.Tensor, concentration_major: float, dev: t
     return smoothed_xb
 
 def train_random_smoothing(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, writer, scheduler,
-                           target_epsilon: float, epochs: int = 10, early_stopping_patience: int = 10, early_stopping_min_delta: float = 1e-4) -> None:
+                           target_epsilon: float, epochs: int = 10, early_stopping_patience: int = 10, early_stopping_min_delta: float = 1e-4, trial=None, grad_clip: float = 5.0) -> None:
     
     dirichlet_concentration = concentration_from_epsilon(target_epsilon)
     print(f"Starting randomized smoothing training with target epsilon = {target_epsilon:.4f} (Dirichlet conc = {dirichlet_concentration:.2f}) and early stopping (patience={early_stopping_patience}, min_delta={early_stopping_min_delta})...")
@@ -654,7 +826,8 @@ def train_random_smoothing(model, train_loader, val_loader, loss_fn, optimizer, 
 
             scaler.scale(loss_adv).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss_adv.item()
@@ -662,13 +835,24 @@ def train_random_smoothing(model, train_loader, val_loader, loss_fn, optimizer, 
 
         avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
         avg_val_loss = validate_epoch(model, val_loader, loss_fn, dev)
+        val_acc = compute_validation_accuracy(model, val_loader, dev)
         
         # Step scheduler first, then log the potentially new LR
         scheduler.step(avg_val_loss)
         writer.add_scalar('Loss/train_random_smoothing', avg_train_loss, epoch)
         writer.add_scalar('Loss/validation_random_smoothing', avg_val_loss, epoch)
+        writer.add_scalar('Accuracy/validation_random_smoothing', val_acc, epoch)
         writer.add_scalar('LR/train_random_smoothing', scheduler.optimizer.param_groups[0]['lr'], epoch)
         print(f"  Epoch {epoch + 1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Target Epsilon: {target_epsilon:.4f}")
+
+        # Optuna pruning hook
+        if trial is not None and optuna is not None:
+            try:
+                trial.report(float(avg_val_loss), step=epoch)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+            except Exception:
+                pass
 
         # Check for improvement
         if (best_val_loss - avg_val_loss) > early_stopping_min_delta:
@@ -808,7 +992,7 @@ def generate_direct_hotflip_examples_optimized(model, xb, yb, loss_fn, flip_frac
 
 def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, writer, scheduler,
                   max_flip_fraction: float, epochs: int = 10, use_scheduling: bool = True, 
-                  early_stopping_patience: int = 25, early_stopping_min_delta: float = 1e-4, gc_pos: float = 0.5) -> None:
+                  early_stopping_patience: int = 25, early_stopping_min_delta: float = 1e-4, gc_pos: float = 0.5, trial=None, grad_clip: float = 5.0) -> None:
     
     scheduling_str = "ON" if use_scheduling else "OFF"
     early_stop_str = f"ON (patience={early_stopping_patience}, min_delta={early_stopping_min_delta})"
@@ -861,7 +1045,8 @@ def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scal
 
             scaler.scale(loss_adv).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss_adv.item()
@@ -869,6 +1054,7 @@ def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scal
 
         avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
         avg_val_loss = validate_epoch(model, val_loader, loss_fn, dev)
+        val_acc = compute_validation_accuracy(model, val_loader, dev)
         
         # For scheduled training, we help the LR scheduler by telling it to compare
         # against the previous epoch's loss, not the global best, to account for
@@ -880,6 +1066,7 @@ def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scal
         scheduler.step(avg_val_loss)
         writer.add_scalar('Loss/train_adversarial', avg_train_loss, epoch)
         writer.add_scalar('Loss/validation_adversarial', avg_val_loss, epoch)
+        writer.add_scalar('Accuracy/validation_adversarial', val_acc, epoch)
         writer.add_scalar('LR/train_adversarial', scheduler.optimizer.param_groups[0]['lr'], epoch)
         writer.add_scalar('Epsilon/train_adversarial', current_flip_fraction, epoch)
         
@@ -911,6 +1098,15 @@ def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scal
             writer.flush()
             break
 
+        # Optuna pruning hook
+        if trial is not None and optuna is not None:
+            try:
+                trial.report(float(avg_val_loss), step=epoch)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+            except Exception:
+                pass
+
         # Early stopping logic now compares with the *previous* epoch's val_loss,
         # which is more robust for scheduled adversarial training where val_loss
         # may not be monotonically decreasing.
@@ -930,7 +1126,7 @@ def train_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scal
 
 def train_direct_hotflip(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, writer, scheduler,
                          max_flip_fraction: float, epochs: int = 10, use_scheduling: bool = True, 
-                         early_stopping_patience: int = 25, early_stopping_min_delta: float = 1e-4, gc_pos: float = 0.5) -> None:
+                         early_stopping_patience: int = 25, early_stopping_min_delta: float = 1e-4, gc_pos: float = 0.5, trial=None, grad_clip: float = 5.0) -> None:
     
     scheduling_str = "ON" if use_scheduling else "OFF"
     early_stop_str = f"ON (patience={early_stopping_patience}, min_delta={early_stopping_min_delta})"
@@ -982,7 +1178,8 @@ def train_direct_hotflip(model, train_loader, val_loader, loss_fn, optimizer, de
 
             scaler.scale(loss_adv).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss_adv.item()
@@ -990,6 +1187,7 @@ def train_direct_hotflip(model, train_loader, val_loader, loss_fn, optimizer, de
 
         avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
         avg_val_loss = validate_epoch(model, val_loader, loss_fn, dev)
+        val_acc = compute_validation_accuracy(model, val_loader, dev)
         
         # For scheduled training, we help the LR scheduler by telling it to compare
         # against the previous epoch's loss, not the global best
@@ -1000,6 +1198,7 @@ def train_direct_hotflip(model, train_loader, val_loader, loss_fn, optimizer, de
         scheduler.step(avg_val_loss)
         writer.add_scalar('Loss/train_direct_hotflip', avg_train_loss, epoch)
         writer.add_scalar('Loss/validation_direct_hotflip', avg_val_loss, epoch)
+        writer.add_scalar('Accuracy/validation_direct_hotflip', val_acc, epoch)
         writer.add_scalar('LR/train_direct_hotflip', scheduler.optimizer.param_groups[0]['lr'], epoch)
         writer.add_scalar('Epsilon/train_direct_hotflip', current_flip_fraction, epoch)
         
@@ -1030,6 +1229,15 @@ def train_direct_hotflip(model, train_loader, val_loader, loss_fn, optimizer, de
             writer.add_scalar('AbnormalEvents/nan_loss_epoch', epoch + 1, 0)
             writer.flush()
             break
+
+        # Optuna pruning hook
+        if trial is not None and optuna is not None:
+            try:
+                trial.report(float(avg_val_loss), step=epoch)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+            except Exception:
+                pass
 
         # Early stopping logic
         if (previous_val_loss - avg_val_loss) > early_stopping_min_delta:
@@ -1652,7 +1860,7 @@ def run_single_experiment(args, seed: int, main_ds, tb_run_dir: str, npz_run_dir
         except Exception as e:
             print(f"  ✗ Standard model compilation failed: {type(e).__name__}")
     opt_standard = torch.optim.AdamW(standard_model.parameters(), lr=3e-4, weight_decay=1e-6)
-    std_writer = SummaryWriter(log_dir=os.path.join(tb_run_dir, f"seed_{seed}", "standard"))
+    std_writer = make_writer(log_dir=os.path.join(tb_run_dir, f"seed_{seed}", "standard"))
     std_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_standard, 'min', factor=0.5, patience=8, verbose=True)
 
     train_standard(standard_model, train_dl, val_dl, bce, opt_standard, dev, scaler, std_writer, std_scheduler, epochs=epochs, early_stopping_patience=15)
@@ -1697,7 +1905,7 @@ def run_single_experiment(args, seed: int, main_ds, tb_run_dir: str, npz_run_dir
             except Exception as e:
                 print(f"  ✗ Robust model (ε={param_val:.4f}) compilation failed: {type(e).__name__}")
         opt = torch.optim.AdamW(mdl.parameters(), lr=3e-4, weight_decay=1e-6)
-        rob_writer = SummaryWriter(log_dir=os.path.join(tb_run_dir, f"seed_{seed}", f"{param_name}_{param_val:.4f}"))
+        rob_writer = make_writer(log_dir=os.path.join(tb_run_dir, f"seed_{seed}", f"{param_name}_{param_val:.4f}"))
         rob_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', factor=0.5, patience=8, verbose=True)
         
         # Branch for training function and its specific arguments
@@ -1752,6 +1960,518 @@ def run_single_experiment(args, seed: int, main_ds, tb_run_dir: str, npz_run_dir
 # --------------------------------------------------------------------------- #
 # 6. Main entry-point
 # --------------------------------------------------------------------------- #
+
+# ---------------------------
+# Optuna HPO utilities
+# ---------------------------
+
+def _make_dataloaders_for_hpo(main_ds, seed: int, train_batch_size: int, eval_batch_size: int):
+    train_size = int(0.70 * N_TOTAL)
+    val_size = int(0.15 * N_TOTAL)
+    test_size = N_TOTAL - train_size - val_size
+    train_ds, val_ds, test_ds = random_split(
+        main_ds,
+        [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(seed)
+    )
+
+    num_cpu_available = os.cpu_count() or 4
+    effective_num_workers = (
+        int(os.environ.get("SLURM_CPUS_PER_TASK", NUM_WORKERS))
+        if "SLURM_CPUS_PER_TASK" in os.environ
+        else NUM_WORKERS
+    )
+    effective_num_workers = min(num_cpu_available, int(effective_num_workers))
+
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=train_batch_size,
+        shuffle=True,
+        num_workers=effective_num_workers,
+        pin_memory=True,
+        persistent_workers=effective_num_workers > 0,
+        prefetch_factor=2 if effective_num_workers > 0 else None,
+    )
+    val_dl = DataLoader(
+        val_ds,
+        batch_size=eval_batch_size,
+        num_workers=effective_num_workers,
+        pin_memory=True,
+        persistent_workers=effective_num_workers > 0,
+        prefetch_factor=2 if effective_num_workers > 0 else None,
+    )
+    test_dl = DataLoader(
+        test_ds,
+        batch_size=eval_batch_size,
+        num_workers=effective_num_workers,
+        pin_memory=True,
+        persistent_workers=effective_num_workers > 0,
+        prefetch_factor=2 if effective_num_workers > 0 else None,
+    )
+    return train_dl, val_dl, test_dl
+
+
+def _build_model_from_params(trial_params: dict) -> TinyCNN:
+    model = TinyCNN(
+        k1=trial_params.get('k1', 30),
+        k2=trial_params.get('k2', 3),
+        k3=trial_params.get('k3', 3),
+        c1=trial_params.get('c1', 32),
+        c2=trial_params.get('c2', 64),
+        c3=trial_params.get('c3', 128),
+        pool_w=trial_params.get('pool_w', 50),
+        drop_conv1=trial_params.get('drop_conv1', 0.1),
+        drop_conv2=trial_params.get('drop_conv2', 0.1),
+        drop_conv3=trial_params.get('drop_conv3', 0.1),
+        drop_fc=trial_params.get('drop_fc', 0.5),
+        act1=trial_params.get('act1', 'exp'),
+    )
+    return model
+
+
+def run_study(args):
+    if optuna is None:
+        print("Error: Optuna is not installed. Please install it: pip install optuna 'optuna[postgresql]' 'optuna[mysql]'")
+        sys.exit(1)
+
+    # Dataset selection: always 27 dataset combos (gc x cons). Schedule is passed explicitly for robust modes.
+    if args.array_idx is not None:
+        combos = [{
+            'gc': gc_val,
+            'cons': cons_val,
+        } for gc_val in GC_HPARAMS for cons_val in CONS_HPARAMS]
+        idx = int(args.array_idx) % len(combos)
+        combo = combos[idx]
+        gc_hparam, cons_hparam = combo['gc'], combo['cons']
+    else:
+        gc_hparam, cons_hparam = 0.6, 0.7
+
+    storage = args.storage or os.environ.get("OPTUNA_STORAGE") or "sqlite:///./optuna.db"
+
+    # Sampler and study directions
+    if args.sampler == "nsga2":
+        sampler = NSGAIISampler()
+        directions = ["maximize", "maximize"]  # (val_acc, saliency_auc)
+    else:
+        sampler = TPESampler()
+        directions = ["maximize"]  # scalar objective: saliency_auc
+
+    # Pruner
+    if args.pruner == "hyperband":
+        max_epochs = args.max_epochs or args.epochs or 40
+        pruner = HyperbandPruner(min_resource=5, max_resource=max_epochs, reduction_factor=3)
+    elif args.pruner == "median":
+        pruner = optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=5)
+    else:
+        pruner = None
+
+    # Study creation (multi-study: suffix by dataset, mode, and schedule if robust)
+    try:
+        study_name_actual = f"{args.study_name}_gc{gc_hparam:.3f}_cons{cons_hparam:.2f}_mode_{args.mode}"
+        print(f"[HPO] Creating/connecting study: {study_name_actual}")
+        study = optuna.create_study(
+            directions=directions,
+            sampler=sampler,
+            pruner=pruner,
+            storage=storage,
+            study_name=study_name_actual,
+            load_if_exists=True,
+        )
+    except Exception as e:
+        print(f"Failed to create/connect study: {e}")
+        print("If using PostgreSQL: pip install \"optuna[postgresql]\" psycopg2-binary")
+        print("If using MySQL/MariaDB: pip install \"optuna[mysql]\"")
+        sys.exit(1)
+
+    # Prepare dataset once per study to minimize I/O
+    main_dataset = load_or_generate_dataset(gc_pos=gc_hparam, conservation=cons_hparam)
+
+    # SLURM usage examples
+    # Example SLURM usage (parallel workers share the same study/storage):
+    #   export OPTUNA_STORAGE="sqlite:////scratch/$USER/optuna.db"
+    #   python toy_slurm.py --tune --study-name tinycnn_dev --n-trials 10 --mode standard
+    #
+    #   export OPTUNA_STORAGE="postgresql+psycopg2://USER:PASS@DBHOST:5432/optuna"
+    #   sbatch --array=1-20 --gres=gpu:1 -p gpu --mem=20G -t 2:00:00 \
+    #     --wrap='python toy_slurm.py --tune --study-name tinycnn_gc055 --n-trials 400 --mode standard'
+
+    max_epochs = args.max_epochs or args.epochs or 40
+
+    def objective(trial: 'optuna.trial.Trial'):
+        # ---------------- Hyperparameters ----------------
+        def _odd_int(name, low, high, step):
+            v = trial.suggest_int(name, low, high, step=step)
+            # ensure odd
+            if v % 2 == 0:
+                v = v + 1 if v + 1 <= high else v - 1
+            return v
+
+        mode = args.mode
+        # In robust mode, fix architecture/optimizer to best-standard; do not suggest to keep params clean.
+        if mode == 'robust':
+            std_best = _find_best_standard_params_for_dataset(gc_hparam, cons_hparam)
+            # Fallback defaults if standard best not found
+            k1 = int(std_best.get('k1', 30))
+            k2 = int(std_best.get('k2', 3))
+            k3 = int(std_best.get('k3', 3))
+            c1 = int(std_best.get('c1', 32))
+            c2 = int(std_best.get('c2', 64))
+            c3 = int(std_best.get('c3', 128))
+            pool_w = int(std_best.get('pool_w', 50))
+            act1 = std_best.get('act1', 'exp')
+            drop_conv1 = float(std_best.get('drop_conv1', 0.1))
+            drop_conv2 = float(std_best.get('drop_conv2', 0.1))
+            drop_conv3 = float(std_best.get('drop_conv3', 0.1))
+            drop_fc    = float(std_best.get('drop_fc',    0.5))
+
+            optimizer_name = std_best.get('optimizer', 'adamw')
+            lr = float(std_best.get('lr', 3e-4))
+            weight_decay = float(std_best.get('weight_decay', 1e-6))
+            train_batch_size = int(std_best.get('train_batch_size', 512))
+            grad_clip = float(std_best.get('grad_clip', 5.0))
+        else:
+            k1 = trial.suggest_categorical('k1', SEARCH_SPACE['arch']['k1'])
+            k2 = trial.suggest_categorical('k2', SEARCH_SPACE['arch']['k2'])
+            k3 = trial.suggest_categorical('k3', SEARCH_SPACE['arch']['k3'])
+            c1 = trial.suggest_categorical('c1', SEARCH_SPACE['arch']['c1'])
+            c2 = trial.suggest_categorical('c2', SEARCH_SPACE['arch']['c2'])
+            c3 = trial.suggest_categorical('c3', SEARCH_SPACE['arch']['c3'])
+            # pool_w can be a categorical list or an int range; support both
+            pool_w = trial.suggest_categorical('pool_w', SEARCH_SPACE['arch']['pool_w'])
+            act1 = trial.suggest_categorical('act1', SEARCH_SPACE['arch']['act1'])
+            drop_conv1 = trial.suggest_float('drop_conv1', SEARCH_SPACE['arch']['drop_conv1']['low'], SEARCH_SPACE['arch']['drop_conv1']['high'])
+            drop_conv2 = trial.suggest_float('drop_conv2', SEARCH_SPACE['arch']['drop_conv2']['low'], SEARCH_SPACE['arch']['drop_conv2']['high'])
+            drop_conv3 = trial.suggest_float('drop_conv3', SEARCH_SPACE['arch']['drop_conv3']['low'], SEARCH_SPACE['arch']['drop_conv3']['high'])
+            drop_fc    = trial.suggest_float('drop_fc',    SEARCH_SPACE['arch']['drop_fc']['low'],    SEARCH_SPACE['arch']['drop_fc']['high'])
+
+            optimizer_name = trial.suggest_categorical('optimizer', SEARCH_SPACE['opt']['optimizer']) 
+            lr = trial.suggest_float('lr', SEARCH_SPACE['opt']['lr']['low'], SEARCH_SPACE['opt']['lr']['high'], log=SEARCH_SPACE['opt']['lr']['log'])
+            weight_decay = trial.suggest_float('weight_decay', SEARCH_SPACE['opt']['weight_decay']['low'], SEARCH_SPACE['opt']['weight_decay']['high'], log=SEARCH_SPACE['opt']['weight_decay']['log'])
+            train_batch_size = trial.suggest_categorical('train_batch_size', SEARCH_SPACE['opt']['train_batch_size'])
+            grad_clip = trial.suggest_categorical('grad_clip', SEARCH_SPACE['opt']['grad_clip'])
+
+        # Regime-specific: standard vs robust (robust tunes regime, scheduling, epsilon)
+        mode = args.mode
+        epsilon = None
+        max_flip_fraction = None
+        regime = None
+        schedule_choice = None
+        if mode == 'robust':
+            regime = trial.suggest_categorical('regime', ['random_smoothing', 'gaussian_smoothing', 'hotflip', 'direct_hotflip'])
+            # Scheduling applies only to hotflip variants
+            if regime in ['hotflip', 'direct_hotflip']:
+                schedule_choice = trial.suggest_categorical('schedule', ['on', 'off'])
+            else:
+                schedule_choice = 'off'
+            if regime == 'random_smoothing':
+                s = SEARCH_SPACE['regimes']['random_smoothing']['epsilon']
+                epsilon = trial.suggest_float('epsilon', s['low'], s['high'], log=s['log'])
+            elif regime == 'gaussian_smoothing':
+                s = SEARCH_SPACE['regimes']['gaussian_smoothing']['sigma2']
+                epsilon = trial.suggest_float('sigma2', s['low'], s['high'], log=s['log'])
+            else:
+                s = SEARCH_SPACE['regimes'][regime]['max_flip_fraction']
+                max_flip_fraction = trial.suggest_float('max_flip_fraction', s['low'], s['high'], log=s['log'])
+
+        # ---------------- Training/Eval ----------------
+        seed_base = 1000 + trial.number * 17
+        num_seeds = max(1, int(args.num_seeds_per_trial))
+
+        # Create per-trial TB dir
+        tb_root = os.path.join(args.output_dir, 'tensorboard_optuna', f"study_{study_name_actual}", f"trial_{trial.number}")
+        os.makedirs(tb_root, exist_ok=True)
+        # Robust saves artifacts under actual study name to separate from standard studies
+        artifacts_study = study_name_actual if args.mode == 'robust' else args.study_name
+        artifacts_dir = os.path.join(args.artifacts_dir, f"study_{artifacts_study}", f"trial_{trial.number}") if args.save_trial_artifacts else None
+        if artifacts_dir:
+            os.makedirs(artifacts_dir, exist_ok=True)
+
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        scaler = GradScaler()
+        bce = nn.BCEWithLogitsLoss()
+
+        val_acc_list, sal_auc_list = [], []
+
+        for k in range(num_seeds):
+            seed = seed_base + k
+            set_seeds(seed, deterministic=args.deterministic)
+
+            # Dataloaders with tunable train batch size
+            train_dl, val_dl, test_dl = _make_dataloaders_for_hpo(
+                main_dataset, seed=seed, train_batch_size=int(train_batch_size), eval_batch_size=DEFAULT_EVAL_BATCH_SIZE
+            )
+
+            # Build model; in robust mode, prefer best standard arch/act/dropouts if available
+            params_for_model = {
+                'k1': std_best.get('k1', k1) if mode == 'robust' else k1,
+                'k2': std_best.get('k2', k2) if mode == 'robust' else k2,
+                'k3': std_best.get('k3', k3) if mode == 'robust' else k3,
+                'c1': std_best.get('c1', c1) if mode == 'robust' else c1,
+                'c2': std_best.get('c2', c2) if mode == 'robust' else c2,
+                'c3': std_best.get('c3', c3) if mode == 'robust' else c3,
+                'pool_w': std_best.get('pool_w', pool_w) if mode == 'robust' else pool_w,
+                'drop_conv1': std_best.get('drop_conv1', drop_conv1) if mode == 'robust' else drop_conv1,
+                'drop_conv2': std_best.get('drop_conv2', drop_conv2) if mode == 'robust' else drop_conv2,
+                'drop_conv3': std_best.get('drop_conv3', drop_conv3) if mode == 'robust' else drop_conv3,
+                'drop_fc': std_best.get('drop_fc', drop_fc) if mode == 'robust' else drop_fc,
+                'act1': std_best.get('act1', act1) if mode == 'robust' else act1,
+            }
+            model = _build_model_from_params(params_for_model).to(dev)
+            if hasattr(torch, "compile"):
+                try:
+                    model = torch.compile(model)
+                except Exception:
+                    pass
+
+            # Optimizer
+            # In robust mode, prefer best standard optimizer hyperparams if available
+            if mode == 'robust':
+                opt_name_eff = std_best.get('optimizer', optimizer_name) or optimizer_name
+                lr_eff = float(std_best.get('lr', lr) or lr)
+                wd_eff = float(std_best.get('weight_decay', weight_decay) or weight_decay)
+            else:
+                opt_name_eff = optimizer_name
+                lr_eff = float(lr)
+                wd_eff = float(weight_decay)
+            if opt_name_eff == 'adamw':
+                opt = torch.optim.AdamW(model.parameters(), lr=lr_eff, weight_decay=wd_eff)
+            else:
+                opt = torch.optim.Adam(model.parameters(), lr=lr_eff, weight_decay=0.0)
+
+            writer = make_writer(log_dir=os.path.join(tb_root, f"seed_{seed}"))
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', factor=0.5, patience=8, verbose=False)
+
+            # Train according to regime
+            try:
+                if mode == 'standard':
+                    train_standard(model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler,
+                                   epochs=max_epochs, early_stopping_patience=15, trial=trial, grad_clip=float(grad_clip))
+                elif mode == 'robust' and regime == 'random_smoothing' and epsilon is not None:
+                    train_random_smoothing(model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler,
+                                           target_epsilon=float(epsilon), epochs=max_epochs, early_stopping_patience=10, trial=trial, grad_clip=float(grad_clip))
+                elif mode == 'robust' and regime == 'gaussian_smoothing' and epsilon is not None:
+                    train_gaussian_smoothing(model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler,
+                                             sigma2=float(epsilon), epochs=max_epochs, early_stopping_patience=10, trial=trial, grad_clip=float(grad_clip))
+                elif mode == 'robust' and regime == 'hotflip' and max_flip_fraction is not None:
+                    train_hotflip(model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler,
+                                  max_flip_fraction=float(max_flip_fraction), epochs=max_epochs, use_scheduling=(schedule_choice=="on"), early_stopping_patience=25, gc_pos=gc_hparam, trial=trial, grad_clip=float(grad_clip))
+                elif mode == 'robust' and regime == 'direct_hotflip' and max_flip_fraction is not None:
+                    train_direct_hotflip(model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler,
+                                         max_flip_fraction=float(max_flip_fraction), epochs=max_epochs, use_scheduling=(schedule_choice=="on"), early_stopping_patience=25, gc_pos=gc_hparam, trial=trial, grad_clip=float(grad_clip))
+                else:
+                    raise ValueError(f"Unsupported configuration or missing params: mode={mode}, regime={regime}")
+            finally:
+                writer.flush(); writer.close()
+
+            # Validation accuracy
+            val_acc = compute_validation_accuracy(model, val_dl, dev)
+
+            # Saliency AUC on validation set (reuse evaluation pipeline on val loader)
+            try:
+                wio, _, sal_auc, _, _ = evaluate_model(model, val_dl, dev, pgd_cache={})
+            except Exception as e:
+                print(f"Saliency AUC computation failed: {e}")
+                raise
+
+            val_acc_list.append(val_acc)
+            sal_auc_list.append(float(sal_auc))
+
+            # Save minimal artifacts
+            if artifacts_dir:
+                params_path = os.path.join(artifacts_dir, f"seed_{seed}_params.json")
+                metrics_path = os.path.join(artifacts_dir, f"seed_{seed}_metrics.json")
+                with open(params_path, 'w') as f:
+                    json.dump({
+                        'k1': k1, 'k2': k2, 'k3': k3, 'c1': c1, 'c2': c2, 'c3': c3,
+                        'pool_w': pool_w, 'act1': act1,
+                        'drop_conv1': drop_conv1, 'drop_conv2': drop_conv2, 'drop_conv3': drop_conv3, 'drop_fc': drop_fc,
+                        'optimizer': optimizer_name, 'lr': lr, 'weight_decay': weight_decay,
+                        'train_batch_size': train_batch_size, 'grad_clip': grad_clip,
+                        'mode': mode, 'regime': regime, 'schedule': schedule_choice, 'epsilon': epsilon, 'max_flip_fraction': max_flip_fraction,
+                        'gc_pos': gc_hparam, 'conservation': cons_hparam,
+                    }, f)
+                with open(metrics_path, 'w') as f:
+                    json.dump({'val_acc': val_acc, 'saliency_auc': float(sal_auc)}, f)
+
+        # Aggregate across seeds
+        val_acc_mean = float(np.mean(val_acc_list))
+        sal_auc_mean = float(np.mean(sal_auc_list))
+
+        # Store in user attrs for downstream filtering
+        trial.set_user_attr('val_acc', val_acc_mean)
+        trial.set_user_attr('saliency_auc', sal_auc_mean)
+
+        # Return objectives
+        if args.sampler == 'nsga2':
+            return val_acc_mean, sal_auc_mean
+        else:
+            # Scalar objective for TPE: maximize Saliency AUC
+            return sal_auc_mean
+
+    study.optimize(objective, n_trials=args.n_trials, n_jobs=1)
+
+    # ---------------- Post-processing ----------------
+    # Save results under the actual per-dataset study name to avoid collisions
+    out_dir = os.path.join('optuna_results', study_name_actual)
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        df = study.trials_dataframe(attrs=("number","value","values","params","state","duration"))
+        df.to_csv(os.path.join(out_dir, 'trials.csv'), index=False)
+    except Exception:
+        pass
+
+    # Summaries
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    pruned = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
+    failed = [t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]
+
+    # Pareto (only meaningful for multi-objective)
+    pareto = []
+    if len(study.directions) == 2:
+        try:
+            for t in study.best_trials:
+                va = t.values[0] if t.values is not None else None
+                sa = t.values[1] if t.values is not None else None
+                pareto.append({'number': t.number, 'val_acc': va, 'saliency_auc': sa, 'params': t.params})
+        except Exception:
+            pareto = []
+
+    # Constraint: Acc >= 0.90, select by highest Saliency AUC
+    eligible = []
+    for t in completed:
+        va = None
+        sa = None
+        if t.values is not None:
+            if len(study.directions) == 2:
+                va, sa = t.values[0], t.values[1]
+            else:
+                sa = t.value
+                va = t.user_attrs.get('val_acc')
+        else:
+            va = t.user_attrs.get('val_acc')
+            sa = t.user_attrs.get('saliency_auc') or t.value
+        if va is not None and va >= 0.90 and sa is not None:
+            eligible.append({'number': t.number, 'val_acc': float(va), 'saliency_auc': float(sa), 'params': t.params})
+    eligible_sorted = sorted(eligible, key=lambda x: x['saliency_auc'], reverse=True)
+    top10 = eligible_sorted[:10]
+
+    summary = {
+        'study_name': study_name_actual,
+        'storage': storage,
+        'dataset': {'gc_pos': gc_hparam, 'conservation': cons_hparam},
+        'counts': {'completed': len(completed), 'pruned': len(pruned), 'failed': len(failed), 'total': len(study.trials)},
+        'pareto_front': pareto,
+        'acc_ge_0.90_top10': top10,
+    }
+    with open(os.path.join(out_dir, 'summary.json'), 'w') as f:
+        json.dump(summary, f, indent=2)
+
+    # Print concise table
+    if top10:
+        print("Top 10 trials with Acc >= 0.90 (sorted by Saliency AUC):")
+        for r in top10:
+            print(f"  Trial {r['number']}: acc={r['val_acc']:.3f}, auc={r['saliency_auc']:.3f}, key params={{k1:{r['params'].get('k1')}, c1:{r['params'].get('c1')}, pool_w:{r['params'].get('pool_w')}, lr:{r['params'].get('lr')}}}")
+    else:
+        print("No trials achieved Acc >= 0.90. Review Pareto trade-offs or extend budget.")
+
+    return study
+
+
+def run_reval_trial(args):
+    if optuna is None:
+        print("Error: Optuna is not installed. Please install it: pip install optuna")
+        sys.exit(1)
+
+    storage = args.storage or os.environ.get("OPTUNA_STORAGE") or "sqlite:///./optuna.db"
+    try:
+        study = optuna.load_study(study_name=args.study_name, storage=storage)
+    except Exception as e:
+        print(f"Failed to load study: {e}")
+        sys.exit(1)
+
+    trial = next((t for t in study.trials if t.number == args.reval_trial), None)
+    if trial is None or trial.state != optuna.trial.TrialState.COMPLETE:
+        print(f"Trial {args.reval_trial} not found or not COMPLETE.")
+        sys.exit(1)
+
+    params = trial.params
+
+    # Dataset selection same as run_study
+    if args.array_idx is not None:
+        combos = get_experiment_combos('adv_vs_std')
+        if args.array_idx < 0 or args.array_idx >= len(combos):
+            raise ValueError(f"array_idx {args.array_idx} out of range for reval (0-{len(combos)-1})")
+        combo = combos[args.array_idx]
+        gc_hparam, cons_hparam = combo['gc'], combo['cons']
+    else:
+        gc_hparam, cons_hparam = 0.6, 0.7
+
+    main_dataset = load_or_generate_dataset(gc_pos=gc_hparam, conservation=cons_hparam)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    scaler = GradScaler()
+    bce = nn.BCEWithLogitsLoss()
+
+    seeds = max(1, int(args.reval_seeds))
+    mode = args.mode
+    val_accs, aucs = [], []
+
+    for k in range(seeds):
+        seed = 4242 + k
+        set_seeds(seed, deterministic=args.deterministic)
+        train_bs = int(params.get('train_batch_size', 512))
+        train_dl, val_dl, _ = _make_dataloaders_for_hpo(main_dataset, seed=seed, train_batch_size=train_bs, eval_batch_size=DEFAULT_EVAL_BATCH_SIZE)
+
+        model = _build_model_from_params(params).to(dev)
+        if hasattr(torch, "compile"):
+            try:
+                model = torch.compile(model)
+            except Exception:
+                pass
+
+        optimizer_name = params.get('optimizer', 'adamw')
+        lr = float(params.get('lr', 3e-4))
+        weight_decay = float(params.get('weight_decay', 1e-6))
+        grad_clip = float(params.get('grad_clip', 5.0))
+        if optimizer_name == 'adamw':
+            opt = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+        else:
+            opt = torch.optim.Adam(model.parameters(), lr=float(lr), weight_decay=0.0)
+        writer = make_writer(log_dir=os.path.join(args.output_dir, 'tensorboard_optuna', f"study_{args.study_name}", f"reval_trial_{trial.number}", f"seed_{seed}"))
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', factor=0.5, patience=8, verbose=False)
+
+        max_epochs = args.max_epochs or args.epochs or 40
+        if mode == 'standard':
+            train_standard(model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler, epochs=max_epochs, early_stopping_patience=15, trial=None, grad_clip=grad_clip)
+        elif mode == 'random_smoothing' and 'epsilon' in params:
+            train_random_smoothing(model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler, target_epsilon=float(params['epsilon']), epochs=max_epochs, early_stopping_patience=10, trial=None, grad_clip=grad_clip)
+        elif mode == 'hotflip' and 'max_flip_fraction' in params:
+            train_hotflip(model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler, max_flip_fraction=float(params['max_flip_fraction']), epochs=max_epochs, use_scheduling=True, early_stopping_patience=25, gc_pos=gc_hparam, trial=None, grad_clip=grad_clip)
+        elif mode == 'direct_hotflip' and 'max_flip_fraction' in params:
+            train_direct_hotflip(model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler, max_flip_fraction=float(params['max_flip_fraction']), epochs=max_epochs, use_scheduling=True, early_stopping_patience=25, gc_pos=gc_hparam, trial=None, grad_clip=grad_clip)
+        else:
+            raise ValueError("Reval mode/params mismatch")
+
+        writer.flush(); writer.close()
+        val_acc = compute_validation_accuracy(model, val_dl, dev)
+        try:
+            _, _, sal_auc, _, _ = evaluate_model(model, val_dl, dev, pgd_cache={})
+        except Exception as e:
+            print(f"Saliency AUC failed during reval: {e}")
+            raise
+        val_accs.append(val_acc); aucs.append(float(sal_auc))
+
+    # Report mean ± SE
+    def mean_se(xs):
+        xs = np.array(xs, dtype=float)
+        m = float(xs.mean()) if xs.size else 0.0
+        se = float(xs.std(ddof=1) / np.sqrt(xs.size)) if xs.size > 1 else 0.0
+        return m, se
+
+    acc_m, acc_se = mean_se(val_accs)
+    auc_m, auc_se = mean_se(aucs)
+    print(f"Re-evaluated Trial {trial.number} over {seeds} seeds: Acc={acc_m:.3f}±{acc_se:.3f}, SaliencyAUC={auc_m:.3f}±{auc_se:.3f}")
+
+    return {'trial': trial.number, 'acc_mean': acc_m, 'acc_se': acc_se, 'auc_mean': auc_m, 'auc_se': auc_se}
 
 def run_experiment_combo(args, combo: dict):
     """
@@ -1848,6 +2568,62 @@ def main(args):
     return
 
 
+def train_gaussian_smoothing(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, writer, scheduler,
+                             sigma2: float, epochs: int = 10, early_stopping_patience: int = 10, early_stopping_min_delta: float = 1e-4, trial=None, grad_clip: float = 5.0) -> None:
+    """Gaussian input smoothing: x' = x + N(0, sigma2 I) (no clamping)."""
+    print(f"Starting gaussian smoothing training with sigma2 = {sigma2:.6f} and early stopping (patience={early_stopping_patience}, min_delta={early_stopping_min_delta})...")
+    sigma = float(np.sqrt(max(sigma2, 0.0)))
+    best_val_loss = float('inf')
+    early_stopping_counter = 0
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0.0
+        num_batches = 0
+        for xb, yb, _ in train_loader:
+            xb, yb = xb.to(dev), yb.to(dev)
+            # Add Gaussian noise
+            noise = torch.randn_like(xb, device=dev) * sigma
+            adv_xb = xb + noise
+            optimizer.zero_grad()
+            with autocast():
+                logits, _ = model(adv_xb)
+                loss = loss_fn(logits, yb)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.item()
+            num_batches += 1
+        avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
+        avg_val_loss = validate_epoch(model, val_loader, loss_fn, dev)
+        val_acc = compute_validation_accuracy(model, val_loader, dev)
+        scheduler.step(avg_val_loss)
+        writer.add_scalar('Loss/train_gaussian_smoothing', avg_train_loss, epoch)
+        writer.add_scalar('Loss/validation_gaussian_smoothing', avg_val_loss, epoch)
+        writer.add_scalar('Accuracy/validation_gaussian_smoothing', val_acc, epoch)
+        writer.add_scalar('LR/train_gaussian_smoothing', scheduler.optimizer.param_groups[0]['lr'], epoch)
+        print(f"  Epoch {epoch + 1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, sigma2: {sigma2:.6f}")
+        if trial is not None and optuna is not None:
+            try:
+                trial.report(float(avg_val_loss), step=epoch)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+            except Exception:
+                pass
+        if (best_val_loss - avg_val_loss) > early_stopping_min_delta:
+            best_val_loss = avg_val_loss
+            early_stopping_counter = 0
+        else:
+            early_stopping_counter += 1
+        if early_stopping_counter >= early_stopping_patience:
+            print(f"  -> Early stopping at epoch {epoch + 1} due to no improvement in val_loss for {early_stopping_patience} epochs.")
+            writer.add_scalar('AbnormalEvents/early_stopped_at_epoch', epoch + 1, 0)
+            writer.flush()
+            break
+
+
 def main_single_combo(args, array_idx: int):
     """
     Run experiments for a single combination determined by a SLURM array_idx.
@@ -1880,9 +2656,9 @@ if __name__ == "__main__":
     except RuntimeError:
         print("Multiprocessing start method already set.")
 
-    parser = argparse.ArgumentParser(description="Run robustness experiment or aggregate results.")
-    parser.add_argument("--output_dir", type=str, required=True, help="Where to save results and plots.")
-    parser.add_argument("--epochs", type=int, default=50, help="Training epochs.")
+    parser = argparse.ArgumentParser(description="Run robustness experiment, Optuna tuning, or aggregate results.")
+    parser.add_argument("--output_dir", type=str, default=CONFIG['paths']['output_dir'], help="Where to save results and plots.")
+    parser.add_argument("--epochs", type=int, default=CONFIG['training']['epochs'], help="Training epochs.")
     parser.add_argument(
         "--task_id",
         type=int,
@@ -1895,27 +2671,12 @@ if __name__ == "__main__":
         default=None,
         help="Index from SLURM_ARRAY_TASK_ID that selects experiment combo.",
     )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=DEFAULT_BATCH_SIZE,
-        help="Training batch size (default 512).",
-    )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=2,
-        help="DataLoader workers (overrides SLURM_CPUS_PER_TASK if provided).",
-    )
+    parser.add_argument("--batch_size", type=int, default=CONFIG['training']['train_batch_size'], help="Training batch size.")
+    parser.add_argument("--num_workers", type=int, default=CONFIG['training']['num_workers'], help="DataLoader workers (overrides SLURM_CPUS_PER_TASK if provided).")
     parser.add_argument(
         "--deterministic",
         action="store_true",
         help="Use deterministic cuDNN kernels for full reproducibility.",
-    )
-    parser.add_argument(
-        "--aggregate_only",
-        action="store_true",
-        help="Skip training entirely and only generate plots from existing npz results.",
     )
     parser.add_argument(
         "--experiment_mode",
@@ -1925,541 +2686,39 @@ if __name__ == "__main__":
         help="Which set of experiments to run (training only).",
     )
 
+    # ----------------------- Optuna HPO extensions ----------------------- #
+    parser.add_argument("--tune", action="store_true", help="Run Optuna HPO instead of fixed training run.")
+    parser.add_argument("--study-name", type=str, default=CONFIG['hpo']['study_name'], help="Optuna study name.")
+    parser.add_argument("--storage", type=str, default=CONFIG['hpo']['storage'], help="Optuna storage URL. If omitted, uses OPTUNA_STORAGE or sqlite:///./optuna.db")
+    parser.add_argument("--sampler", type=str, choices=["nsga2", "tpe"], default=CONFIG['hpo']['sampler'], help="Optuna sampler to use.")
+    parser.add_argument("--pruner", type=str, choices=["hyperband", "median", "none"], default=CONFIG['hpo']['pruner'], help="Optuna pruner to use.")
+    parser.add_argument("--n-trials", type=int, default=CONFIG['hpo']['n_trials'], help="Number of Optuna trials.")
+    parser.add_argument("--max-epochs", type=int, default=CONFIG['hpo']['max_epochs'], help="Max epochs per trial (defaults to --epochs).")
+    parser.add_argument("--num-seeds-per-trial", type=int, default=CONFIG['hpo']['num_seeds_per_trial'], help="Average metrics across this many seeds per trial.")
+    parser.add_argument("--mode", type=str, choices=["standard", "robust"], default="standard", help="HPO mode: standard (arch/opt on clean) or robust (tune regime/scheduling/epsilon).")
+    parser.add_argument("--save-trial-artifacts", action="store_true", default=CONFIG['hpo']['save_trial_artifacts'], help="Save per-trial params/metrics and optional artifacts.")
+    parser.add_argument("--artifacts-dir", type=str, default=CONFIG['paths']['artifacts_dir'], help="Directory for trial artifacts.")
+    parser.add_argument("--reval-trial", type=int, default=None, help="Retrain a specific trial's params for K seeds and report mean±SE.")
+    parser.add_argument("--reval-seeds", type=int, default=5, help="Number of seeds for re-evaluation.")
+    # Removed smoke-test flag to avoid accidental short runs in production
+
     args = parser.parse_args()
 
     # Update global DataLoader defaults
     TRAIN_BATCH_SIZE = args.batch_size
     NUM_WORKERS = args.num_workers
 
-    # ------------------------------------------------------------------ #
-    # Aggregate-only fast path
-    # ------------------------------------------------------------------ #
 
-    if args.aggregate_only:
-        print("Aggregate-only mode: generating combo plots and summary from existing results …")
-        plots_dir = os.path.join(args.output_dir, "plots")
-        os.makedirs(plots_dir, exist_ok=True)
-
-        npz_path = os.path.join(args.output_dir, "npz_results")
-        if not os.path.isdir(npz_path):
-            print(f"Error: The results directory '{npz_path}' could not be found.")
-            sys.exit(1)
-
-        npz_files = glob.glob(os.path.join(npz_path, '**', 'multi_seed_results.npz'), recursive=True)
-        if not npz_files:
-            print(f"No .npz result files found in {npz_path}; nothing to aggregate.")
-            sys.exit(1)
-        
-        print(f"Found {len(npz_files)} result files, building master dataframe...")
-        all_data = []
-        for f_path in npz_files:
-            try:
-                data = np.load(f_path, allow_pickle=True)
-                
-                # Infer experiment type from path
-                if 'iterative_hotflip' in f_path:
-                    mode = 'iterative_hotflip'
-                elif 'direct_hotflip' in f_path:
-                    mode = 'direct_hotflip'
-                else: # Fallback for older runs
-                    mode = 'iterative_hotflip'
-
-                is_scheduled = data.get('scheduling') and data['scheduling'].item()
-                scheduling_mode = "scheduled" if is_scheduled else "no_schedule"
-                
-                gc_pos = float(data['gc_pos'].item())
-                cons = float(data['conservation'].item())
-                seeds = data['seeds']
-                
-                std_metrics = {
-                    'wIoU': data.get('std_wious', []), 'Accuracy': data.get('std_accs', []),
-                    'SaliencyAUC': data.get('std_aucs', []), 'SaliencySNR': data.get('std_snrs', [])
-                }
-                std_pgd_stats = data.get('std_pgd_stats', [{} for _ in seeds])
-
-                rob_metrics = {
-                    'wIoU': data.get('rob_wious', []), 'Accuracy': data.get('rob_accs', []),
-                    'SaliencyAUC': data.get('rob_aucs', []), 'SaliencySNR': data.get('rob_snrs', [])
-                }
-                rob_pgd_stats = data.get('rob_pgd_stats', [[] for _ in seeds])
-
-                if mode == 'iterative_hotflip':
-                    params = data['epsilons']
-                    param_name = 'epsilon'
-                elif mode == 'direct_hotflip':
-                    # Use the correct key for direct_hotflip, with a fallback for older file formats.
-                    params = data['direct_hotflip_epsilons'] if 'direct_hotflip_epsilons' in data else data['epsilons']
-                    param_name = 'epsilon'
-                else: # Should not happen with current script
-                    params = []
-                    param_name = 'param'
-                
-                for i, seed in enumerate(seeds):
-                    # Add standard model results (param_val = 0)
-                    all_data.append({
-                        'scheduling_mode': scheduling_mode, 'mode': mode,
-                        'gc_pos': gc_pos, 'conservation': cons, 'seed': seed,
-                        'param_name': param_name, 'param_val': 0,
-                        'wIoU': std_metrics['wIoU'][i], 'Accuracy': std_metrics['Accuracy'][i],
-                        'SaliencyAUC': std_metrics['SaliencyAUC'][i], 'SaliencySNR': std_metrics['SaliencySNR'][i],
-                        'pgd_success_rate': std_pgd_stats[i].get('pgd_success_rate', 0),
-                        'pgd_mean_iters_to_flip': std_pgd_stats[i].get('pgd_mean_iters_to_flip', 0)
-                    })
-                    
-                    # Add robust model results
-                    for j, p_val in enumerate(params):
-                        pgd_stats_list = rob_pgd_stats[i] if rob_pgd_stats is not None and i < len(rob_pgd_stats) else []
-                        current_pgd_stats = pgd_stats_list[j] if pgd_stats_list is not None and j < len(pgd_stats_list) else {}
-                        
-                        all_data.append({
-                            'scheduling_mode': scheduling_mode, 'mode': mode,
-                            'gc_pos': gc_pos, 'conservation': cons, 'seed': seed,
-                            'param_name': param_name, 'param_val': p_val,
-                            'wIoU': rob_metrics['wIoU'][i][j], 'Accuracy': rob_metrics['Accuracy'][i][j],
-                            'SaliencyAUC': rob_metrics['SaliencyAUC'][i][j], 'SaliencySNR': rob_metrics['SaliencySNR'][i][j],
-                            'pgd_success_rate': current_pgd_stats.get('pgd_success_rate', 0),
-                            'pgd_mean_iters_to_flip': current_pgd_stats.get('pgd_mean_iters_to_flip', 0),
-                        })
-            except Exception as e:
-                print(f"Could not process file {f_path}: {e}")
-
-        df = pd.DataFrame(all_data)
-        # Ensure we have data before proceeding
-        if df.empty:
-            print("Master dataframe is empty, cannot generate plots.")
-            sys.exit(1)
-
-        master_csv_path = os.path.join(plots_dir, 'full_results_long_format.csv')
-        df.to_csv(master_csv_path, index=False)
-        print(f"Saved master data table to {master_csv_path}")
-
-        def get_model_type(row):
-            if row['param_val'] == 0: return 'Standard'
-            
-            # Use the mode inferred from the file path
-            if row['mode'] == 'iterative_hotflip':
-                return 'Iterative HotFlip (Scheduled)' if row['scheduling_mode'] == 'scheduled' else 'Iterative HotFlip (No Schedule)'
-            if row['mode'] == 'direct_hotflip':
-                return 'Direct HotFlip (Scheduled)' if row['scheduling_mode'] == 'scheduled' else 'Direct HotFlip (No Schedule)'
-            
-            # Fallback for old adv_vs_std runs if they exist
-            if row['mode'] == 'adv_vs_std' and row['scheduling_mode'] == 'scheduled': return 'Adversarial (Scheduled)'
-            if row['mode'] == 'adv_vs_std' and row['scheduling_mode'] == 'no_schedule': return 'Adversarial (No Schedule)'
-            return 'Unknown'
-
-        df['model_type'] = df.apply(get_model_type, axis=1)
-
-        baseline_metrics = df[df['model_type'] == 'Standard'].groupby(
-            ['gc_pos', 'conservation', 'seed']
-        ).mean(numeric_only=True).reset_index()
-
-        # Create a separate baseline for per-model metrics like Accuracy
-        baseline_model_metrics = df[df['model_type'] == 'Standard'][['gc_pos', 'conservation', 'seed', 'Accuracy']].drop_duplicates()
-
-        df_robust = df[df['model_type'] != 'Standard'].copy()
-        
-        # Merge sample-level metrics
-        df_robust = pd.merge(
-            df_robust,
-            baseline_metrics[['gc_pos', 'conservation', 'seed', 'wIoU', 'SaliencyAUC', 'SaliencySNR']],
-            on=['gc_pos', 'conservation', 'seed'],
-            suffixes=('', '_base')
-        )
-        # Merge model-level accuracy
-        df_robust = pd.merge(
-            df_robust,
-            baseline_model_metrics.rename(columns={'Accuracy': 'Accuracy_base'}),
-            on=['gc_pos', 'conservation', 'seed']
-        )
-
-        metrics_to_plot = ['wIoU', 'Accuracy', 'SaliencyAUC', 'SaliencySNR']
-        
-        # Calculate Root Skill and Linear Skill for SaliencyAUC
-        def calculate_skills(auc_series):
-            p = auc_series
-            s = 2 * p - 1
-            root_skill = np.sign(s) * np.sqrt(np.abs(s))
-            return s, root_skill
-
-        skill_robust, root_skill_robust = calculate_skills(df_robust['SaliencyAUC'])
-        skill_base, root_skill_base = calculate_skills(df_robust['SaliencyAUC_base'])
-        
-        # Normalize the delta by dividing by the maximum possible range (2)
-        df_robust['delta_Skill'] = (skill_robust - skill_base) / 2.0
-
-        for metric in metrics_to_plot:
-            if metric == 'SaliencyAUC':
-                # The primary metric for selection remains RootSkill
-                df_robust[f'delta_{metric}'] = (root_skill_robust - root_skill_base) / 2.0
-            else:
-                df_robust[f'delta_{metric}'] = df_robust[metric] - df_robust[f'{metric}_base']
-
-        # --- Generate Combined Boxplots for all strategies ---
-        print("\n--- Generating Combined Boxplots ---")
-
-        df_plot_box = df_robust[df_robust['model_type'].isin([
-            'Iterative HotFlip (No Schedule)', 'Iterative HotFlip (Scheduled)',
-            'Direct HotFlip (No Schedule)', 'Direct HotFlip (Scheduled)'
-        ])]
-        
-        for metric in metrics_to_plot:
-            print(f"  - Plotting combined boxplot for {metric}...")
-            if df_plot_box.empty:
-                print(f"    Skipping {metric}, no data.")
-                continue
-
-            g = sns.catplot(
-                data=df_plot_box, x="param_val", y=f"delta_{metric}",
-                hue="conservation", col="model_type", row="gc_pos",
-                kind="box", height=3, aspect=1.2, palette='Blues_d',
-                fliersize=0, linewidth=1.0, showfliers=False, sharey=False, sharex=False,
-                margin_titles=True,
-                col_order=['Iterative HotFlip (No Schedule)', 'Iterative HotFlip (Scheduled)', 'Direct HotFlip (No Schedule)', 'Direct HotFlip (Scheduled)']
-            )
-            
-            if metric == 'SaliencyAUC':
-                g.fig.suptitle(f"Change in Saliency Root Skill (Normalized ΔRootSkill) vs. Standard", y=1.05, fontsize=16)
-            else:
-                g.fig.suptitle(f"Improvement in {metric} vs. Standard, by Training Strategy", y=1.05, fontsize=16)
-
-            for (row_idx, col_idx), ax in np.ndenumerate(g.axes):
-                if row_idx >= len(g.row_names) or col_idx >= len(g.col_names): continue
-                
-                gc_val = g.row_names[row_idx]
-                model_type = g.col_names[col_idx]
-                
-                title = f"GC={gc_val} | {model_type}"
-                ax.set_title(title, fontsize=9)
-                ax.axhline(0, ls='--', color='red', zorder=0)
-
-                # Set custom x-axis labels
-                if 'Adversarial' in model_type:
-                    ax.set_xlabel("Epsilon")
-                else:
-                    ax.set_xlabel("Target Epsilon")
-                ax.tick_params(axis='x', rotation=45, labelsize=8)
-
-                # Unify y-axis labels
-                if col_idx == 0:
-                    if metric == 'SaliencyAUC':
-                        ax.set_ylabel("Normalized ΔRootSkill")
-                    else:
-                        ax.set_ylabel(f"Improvement in {metric}")
-                else:
-                    ax.set_ylabel("")
-
-            sns.move_legend(g, "upper center", bbox_to_anchor=(.5, 0.99), ncol=len(df_plot_box['conservation'].unique()), title="Conservation", frameon=False)
-            g.tight_layout(rect=[0, 0, 1, 0.95])
-            plot_path = os.path.join(plots_dir, f"combined_delta_{metric}_boxplot.pdf")
-            g.savefig(plot_path, dpi=300, format='pdf')
-            plt.close(g.fig)
-            print(f"    Saved to {plot_path}")
-
-        # --- Prepare data for absolute value plots ---
-        # For each robust model type, we want to include the corresponding standard model
-        # as the baseline (param_val = 0) in the same facet.
-        print("\n--- Preparing data for absolute value plots ---")
-        df_abs_plot_list = []
-        df_standard_models = df[df['model_type'] == 'Standard'].copy()
-        
-        model_type_to_sched = {
-            'Iterative HotFlip (No Schedule)': 'no_schedule',
-            'Iterative HotFlip (Scheduled)': 'scheduled',
-            'Direct HotFlip (No Schedule)': 'no_schedule',
-            'Direct HotFlip (Scheduled)': 'scheduled',
-        }
-
-        for mtype, sched_mode in model_type_to_sched.items():
-            df_robust_subset = df[df['model_type'] == mtype]
-            df_std_subset = df_standard_models[df_standard_models['scheduling_mode'] == sched_mode].copy()
-            df_std_subset['model_type'] = mtype
-            df_combined = pd.concat([df_robust_subset, df_std_subset])
-            df_abs_plot_list.append(df_combined)
-            
-        df_plot_abs = pd.concat(df_abs_plot_list, ignore_index=True)
-
-
-        # --- Generate Combined Boxplots for Absolute Values ---
-        print("\n--- Generating Combined Absolute Value Boxplots ---")
-        for metric in metrics_to_plot:
-            print(f"  - Plotting combined boxplot for absolute {metric}...")
-            if df_plot_abs.empty:
-                print(f"    Skipping {metric}, no data.")
-                continue
-
-            g = sns.catplot(
-                data=df_plot_abs, x="param_val", y=metric,
-                hue="conservation", col="model_type", row="gc_pos",
-                kind="box", height=3, aspect=1.2, palette='Blues_d',
-                fliersize=0, linewidth=1.0, showfliers=False, sharey=False, sharex=False,
-                margin_titles=True,
-                col_order=['Iterative HotFlip (No Schedule)', 'Iterative HotFlip (Scheduled)', 'Direct HotFlip (No Schedule)', 'Direct HotFlip (Scheduled)']
-            )
-            
-            g.fig.suptitle(f"Absolute {metric} by Training Strategy", y=1.05, fontsize=16)
-
-            for (row_idx, col_idx), ax in np.ndenumerate(g.axes):
-                if row_idx >= len(g.row_names) or col_idx >= len(g.col_names): continue
-                
-                gc_val = g.row_names[row_idx]
-                model_type = g.col_names[col_idx]
-                
-                title = f"GC={gc_val} | {model_type}"
-                ax.set_title(title, fontsize=9)
-                # Removed ax.axhline(0, ls='--', color='gray', zorder=0)
-
-                # Set custom x-axis labels
-                if 'Adversarial' in model_type:
-                    ax.set_xlabel("Epsilon")
-                else:
-                    ax.set_xlabel("Target Epsilon")
-                ax.tick_params(axis='x', rotation=45, labelsize=8)
-
-                # Unify y-axis labels
-                if col_idx == 0:
-                    ax.set_ylabel(f"Absolute {metric}")
-                else:
-                    ax.set_ylabel("")
-
-            sns.move_legend(g, "upper center", bbox_to_anchor=(.5, 0.99), ncol=len(df_plot_abs['conservation'].unique()), title="Conservation", frameon=False)
-            g.tight_layout(rect=[0, 0, 1, 0.95])
-            plot_path = os.path.join(plots_dir, f"combined_absolute_{metric}_boxplot.pdf")
-            g.savefig(plot_path, dpi=300, format='pdf')
-            plt.close(g.fig)
-            print(f"    Saved to {plot_path}")
-            
-        # --- Generate Combined Summary Bar Chart ---
-        print("\n--- Generating Combined Summary Bar Chart ---")
-        
-        # First find the best epsilon for each combination based on mean ΔRootSkill
-        if not df_robust.empty:
-            # Group by all factors except seed to get mean delta_SaliencyAUC (ΔRootSkill) per epsilon
-            best_eps_stats = df_robust.groupby(['model_type', 'gc_pos', 'conservation', 'param_val']).agg({
-                'delta_SaliencyAUC': 'mean'
-            }).reset_index()
-            
-            # Find the param_val that maximizes mean ΔRootSkill for each combination
-            idx_best = best_eps_stats.groupby(['model_type', 'gc_pos', 'conservation'])['delta_SaliencyAUC'].idxmax()
-            best_eps_per_combo = best_eps_stats.loc[idx_best][['model_type', 'gc_pos', 'conservation', 'param_val']]
-            
-            # Now filter df_robust to only include the best epsilon for each combination
-            df_robust_best = pd.merge(
-                df_robust,
-                best_eps_per_combo,
-                on=['model_type', 'gc_pos', 'conservation', 'param_val']
-            )
-        else:
-            df_robust_best = df_robust
-        
-        id_vars = ['scheduling_mode', 'mode', 'model_type', 'gc_pos', 'conservation', 'seed']
-        value_vars = [f'delta_{m}' for m in metrics_to_plot] + ['delta_Skill']
-        df_deltas = pd.melt(df_robust_best, id_vars=id_vars, value_vars=value_vars, var_name='metric', value_name='delta_value')
-        df_deltas['metric'] = df_deltas['metric'].str.replace('delta_', '')
-        # Map SaliencyAUC to its display name for the plot
-        df_deltas['metric'] = df_deltas['metric'].replace({'SaliencyAUC': 'NormΔRootSkill', 'Skill': 'NormΔSkill'})
-
-
-        df_plot_bar = df_deltas[df_deltas['model_type'].isin([
-            'Iterative HotFlip (No Schedule)', 'Iterative HotFlip (Scheduled)',
-            'Direct HotFlip (No Schedule)', 'Direct HotFlip (Scheduled)'
-        ])]
-        
-        if not df_plot_bar.empty:
-            print("  - Plotting combined summary bar chart...")
-            g = sns.catplot(
-                data=df_plot_bar, kind='bar', x='gc_pos', y='delta_value',
-                hue="conservation", col="model_type", row="metric",
-                palette='Blues_d', height=3, aspect=1.4, sharey=False, margin_titles=True,
-                col_order=['Iterative HotFlip (No Schedule)', 'Iterative HotFlip (Scheduled)', 'Direct HotFlip (No Schedule)', 'Direct HotFlip (Scheduled)'],
-                row_order=['Accuracy', 'NormΔSkill', 'NormΔRootSkill', 'wIoU', 'SaliencySNR']
-            )
-            g.set_axis_labels("GC Content (Confounder Strength)", "") # Set X label, but leave Y blank for custom labels
-            g.set_titles(col_template="{col_name}", row_template="{row_name}")
-            g.fig.suptitle("Comparison of Training Strategies: Mean Improvement vs. Standard Model\n(Best ε selected by ΔRootSkill; error bars show SE across 10 seeds)", y=1.03, fontsize=14)
-            
-            # Set a specific Y-axis label for each row
-            for i, ax_row in enumerate(g.axes):
-                metric_name = g.row_names[i]
-                if 'NormΔ' in metric_name:
-                    ax_row[0].set_ylabel(f"Mean {metric_name}")
-                else:
-                    ax_row[0].set_ylabel(f"Mean Δ in {metric_name}")
-
-            for ax in g.axes.flat: 
-                ax.axhline(0, ls='--', color='gray', zorder=0)
-                ax.tick_params(axis='x', rotation=25)
-            
-            sns.move_legend(g, "upper center", bbox_to_anchor=(.5, 0.98), ncol=len(df_plot_bar['conservation'].unique()), title="Conservation", frameon=False)
-            g.tight_layout(rect=[0, 0, 1, 0.95])
-            plot_path = os.path.join(plots_dir, f"summary_bar_combined.pdf")
-            g.savefig(plot_path, dpi=300, format='pdf')
-            plt.close(g.fig)
-            print(f"    Saved to {plot_path}")
-        else:
-            print("  - Skipping summary bar chart: No data found for comparison.")
-
-        # --- Select Best Epsilon and Generate 2x2 Heatmap Grid ---
-        print("\n--- Generating 2x2 Heatmap Grid ---")
-        
-        # First, we need to find the best epsilon for each combination based on SaliencyAUC
-        if not df_robust.empty:
-            # Group by all factors except param_val and seed, find best param_val by mean SaliencyAUC
-            best_eps_df = df_robust.groupby(['model_type', 'gc_pos', 'conservation', 'param_val']).agg({
-                'SaliencyAUC': 'mean'
-            }).reset_index()
-            
-            # Find the param_val that maximizes SaliencyAUC for each combination
-            idx_best = best_eps_df.groupby(['model_type', 'gc_pos', 'conservation'])['SaliencyAUC'].idxmax()
-            best_eps_df = best_eps_df.loc[idx_best]
-            
-            # Now get all the data for these best epsilons
-            df_best_eps = pd.merge(
-                df_robust,
-                best_eps_df[['model_type', 'gc_pos', 'conservation', 'param_val']],
-                on=['model_type', 'gc_pos', 'conservation', 'param_val']
-            )
-            
-            # Calculate mean improvements for the best epsilon across seeds
-            df_heatmap = df_best_eps.groupby(['model_type', 'gc_pos', 'conservation']).agg({
-                'delta_SaliencyAUC': 'mean'
-            }).reset_index()
-            
-            # Create 2x2 grid: one heatmap for each model type
-            model_types_for_heatmap = [
-                'Iterative HotFlip (No Schedule)', 'Iterative HotFlip (Scheduled)',
-                'Direct HotFlip (No Schedule)', 'Direct HotFlip (Scheduled)'
-            ]
-            
-            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            fig.suptitle('Change in Saliency Root Skill (Normalized ΔRootSkill) by Signal and Confounder Strength\n(Best ε selected per combination)', fontsize=14)
-            
-            for idx, model_type in enumerate(model_types_for_heatmap):
-                row = idx // 2
-                col = idx % 2
-                ax = axes[row, col]
-                
-                # Filter data for this model type
-                df_model = df_heatmap[df_heatmap['model_type'] == model_type]
-                
-                if not df_model.empty:
-                    # Pivot for heatmap
-                    pivot_df = df_model.pivot(index='conservation', columns='gc_pos', values='delta_SaliencyAUC')
-                    
-                    # Create heatmap
-                    sns.heatmap(pivot_df, annot=True, fmt='.2f', cmap='coolwarm', center=0,
-                               cbar_kws={'label': 'Normalized ΔRootSkill'},
-                               ax=ax, vmin=-1, vmax=1)
-                    
-                    ax.set_title(model_type)
-                    ax.set_xlabel('GC Content (Confounder Strength)')
-                    ax.set_ylabel('Conservation (Signal Strength)')
-                    ax.invert_yaxis()  # Higher conservation at top
-                else:
-                    ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-                    ax.set_title(model_type)
-            
-            plt.tight_layout(rect=[0, 0, 1, 0.96])
-            plot_path = os.path.join(plots_dir, "heatmap_grid_saliency_auc_improvement.pdf")
-            plt.savefig(plot_path, dpi=300, format='pdf')
-            plt.close(fig)
-            print(f"  Saved heatmap grid to {plot_path}")
-            
-            # Also create a combined heatmap showing the best performing method for each gc/conservation combination
-            print("\n--- Generating Best Method Heatmap ---")
-            
-            # Find which method performs best for each gc_pos/conservation combination
-            df_best_method = df_heatmap.loc[df_heatmap.groupby(['gc_pos', 'conservation'])['delta_SaliencyAUC'].idxmax()]
-            
-            # Create a mapping for shorter names and a list for ordering
-            method_map = {
-                'Iterative HotFlip (No Schedule)': 'Iter-NoSched',
-                'Iterative HotFlip (Scheduled)': 'Iter-Sched',
-                'Direct HotFlip (No Schedule)': 'Direct-NoSched',
-                'Direct HotFlip (Scheduled)': 'Direct-Sched'
-            }
-            method_order = list(method_map.values())
-            
-            df_best_method['method_short'] = df_best_method['model_type'].map(method_map)
-            
-            # Create pivot for the improvement values (to be used as text annotation)
-            pivot_values = df_best_method.pivot(index='conservation', columns='gc_pos', values='delta_SaliencyAUC')
-            
-            # Create a pivot for the method names and map them to integers for coloring
-            pivot_methods_categorical = df_best_method.pivot(index='conservation', columns='gc_pos', values='method_short')
-            pivot_methods_int = pivot_methods_categorical.applymap(lambda x: method_order.index(x) if pd.notna(x) else -1)
-            
-            # Create a discrete colormap
-            cmap = plt.get_cmap('tab10', len(method_order))
-            
-            fig, ax = plt.subplots(figsize=(10, 7))
-            sns.heatmap(pivot_methods_int,
-                        annot=pivot_values,
-                        fmt='.2f',
-                        cmap=cmap,
-                        ax=ax,
-                        linewidths=.5,
-                        cbar=False,  # Disable the default colorbar, we create a manual one
-                        annot_kws={'fontsize': 9})
-            
-            # Manually create a colorbar that acts as a discrete legend
-            norm = plt.cm.colors.BoundaryNorm(np.arange(len(method_order) + 1) - 0.5, cmap.N)
-            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-            sm.set_array([]) # You must set the array for the scalar mappable
-            cbar = fig.colorbar(sm, ax=ax, ticks=np.arange(len(method_order)))
-            cbar.set_ticklabels(method_order)
-            cbar.set_label('Best Performing Method', rotation=270, labelpad=20)
-            
-            ax.set_title('Best Performing Method and Improvement (Normalized ΔRootSkill)\nby Signal and Confounder Strength', fontsize=14)
-            ax.set_xlabel('GC Content (Confounder Strength)')
-            ax.set_ylabel('Conservation (Signal Strength)')
-            ax.invert_yaxis()
-            
-            plt.tight_layout()
-            plot_path = os.path.join(plots_dir, "best_method_heatmap.pdf")
-            plt.savefig(plot_path, dpi=300, format='pdf')
-            plt.close(fig)
-            print(f"  Saved best method heatmap to {plot_path}")
-
-            # --- Generate Linear Skill Heatmap Grid ---
-            print("\n--- Generating Linear Skill (ΔSkill) Heatmap Grid ---")
-            
-            # Calculate mean improvements for the best epsilon across seeds
-            df_heatmap_skill = df_best_eps.groupby(['model_type', 'gc_pos', 'conservation']).agg({
-                'delta_Skill': 'mean'
-            }).reset_index()
-            
-            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            fig.suptitle('Change in Linear Saliency Skill (Normalized ΔSkill) by Signal and Confounder Strength\n(Models selected by best ΔRootSkill)', fontsize=14)
-            
-            for idx, model_type in enumerate(model_types_for_heatmap):
-                row = idx // 2
-                col = idx % 2
-                ax = axes[row, col]
-                
-                df_model = df_heatmap_skill[df_heatmap_skill['model_type'] == model_type]
-                
-                if not df_model.empty:
-                    pivot_df = df_model.pivot(index='conservation', columns='gc_pos', values='delta_Skill')
-                    sns.heatmap(pivot_df, annot=True, fmt='.2f', cmap='coolwarm', center=0,
-                               cbar_kws={'label': 'Normalized ΔSkill (Linear)'},
-                               ax=ax, vmin=-1, vmax=1)
-                    ax.set_title(model_type)
-                    ax.set_xlabel('GC Content (Confounder Strength)')
-                    ax.set_ylabel('Conservation (Signal Strength)')
-                    ax.invert_yaxis()
-                else:
-                    ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-                    ax.set_title(model_type)
-            
-            plt.tight_layout(rect=[0, 0, 1, 0.96])
-            plot_path = os.path.join(plots_dir, "heatmap_grid_linear_skill.pdf")
-            plt.savefig(plot_path, dpi=300, format='pdf')
-            plt.close(fig)
-            print(f"  Saved linear skill heatmap to {plot_path}")
-
-        print("\nAll plotting complete.")
+    # HPO / Re-evaluation entry points
+    if args.tune:
+        run_study(args)
         sys.exit(0)
 
+    if args.reval_trial is not None:
+        run_reval_trial(args)
+        sys.exit(0)
+
+    # Default training/sweep paths (evaluation moved to synthetic/eval_toy.py)
     if args.array_idx is not None:
         main_single_combo(args, args.array_idx)
     else:
