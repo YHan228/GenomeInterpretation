@@ -53,6 +53,7 @@ tensorboard/
 # temporary paper
 wang22e.pdf
 s13059-023-02956-3.pdf
+Rplots.pdf
 
 # any png file with "filter_[0-9].png"
 filter_*.png
@@ -66,6 +67,89 @@ slurm_results/vanilla_run_*
 
 koo*
 
-optuna_results/
-optuna_results_ver1/
+optuna_results*/
 slurm_output/
+
+sporulation/data/
+
+# Editors and IDE settings
+.vscode/
+.idea/
+.ipynb_checkpoints/
+*.code-workspace
+
+# Python build artifacts
+*.py[cod]
+*.pyd
+*.pyo
+*.egg
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Caches and test artifacts
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.cache/
+coverage.xml
+htmlcov/
+
+# Environments and local secrets
+.venv/
+.env
+.env.*
+
+# Databases and state files
+*.db
+*.sqlite
+*.sqlite3
+optuna.db
+
+# ML/Model artifacts
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.h5
+*.joblib
+*.pkl
+*.npy
+
+# Results and large output directories
+results/
+sim_out/
+tensorboard/
+slurm_results/
+slurm_output/
+spore_optuna/
+sporulation/analysis_out/
+sporulation/results/
+sporulation/model/
+sporulation/robust_model/
+phenotype/model/
+phenotype/outputs/
+phenotype/data/
+phenotype/plots/
+phenotype/robust_model/
+
+# Bioinformatics large files
+*.fa
+*.fna
+*.faa
+*.fastq
+*.fq
+*.gff3
+*.gtf
+*.bed
+*.bam
+*.sam
+*.bai
+*.vcf
+*.vcf.gz
+*.fasta.gz
+*.fa.gz
+*.gff.gz
+*.tsv.gz
+*.csv.gz

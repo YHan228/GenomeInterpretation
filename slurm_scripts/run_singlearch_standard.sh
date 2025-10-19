@@ -1,26 +1,22 @@
 #!/bin/bash
-#SBATCH --job-name=optuna_unified
-#SBATCH --output=slurm_output/optuna_unified_%A_%a.out
-#SBATCH --error=slurm_output/optuna_unified_%A_%a.err
+#SBATCH --job-name=optuna_unified_std
+#SBATCH --output=slurm_output/optuna_unified_std_%A_%a.out
+#SBATCH --error=slurm_output/optuna_unified_std_%A_%a.err
 #SBATCH --time=6-00:00:00
 #SBATCH --partition=gpu
 #SBATCH --qos=verylong
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:h100:1
+#SBATCH --gres=gpu:1
 #SBATCH --mem=50G  # Increased memory since we load all datasets
 
-# Unified Optuna HPO script for finding ONE best model across ALL datasets.
+# Unified Optuna HPO script (STANDARD mode) for finding ONE best model across ALL datasets.
 # Each worker explores different hyperparameters but evaluates on multiple datasets.
-# 
-# RECOMMENDED USAGE:
-#   For TPE (Bayesian optimization): Use 4-8 parallel workers
-#   sbatch --array=1-6 slurm_scripts/run_optuna_singlearch.sh
 #
-# The unified approach means:
-#   - No dataset-specific studies (one unified study)
-#   - Each trial evaluates on multiple datasets
-#   - Objective: maximize average Saliency AUC across datasets
-#   - TPE learns from previous trials to suggest better hyperparameters
+# Usage:
+#   sbatch --array=1-6 slurm_scripts/run_optuna_standard.sh
+#
+# Optional environment overrides:
+#   STUDY_NAME, N_TRIALS, SAMPLER, PRUNER, MAX_EPOCHS, NUM_SEEDS_PER_TRIAL
 
 source /home/yhan/miniconda3/etc/profile.d/conda.sh
 conda activate genome
@@ -70,20 +66,24 @@ if [ -z "$OPTUNA_STORAGE" ]; then
   exit 1
 fi
 
+# Fixed mode for this script
+HPO_MODE="standard"       # standard only
+
 # Configuration variables with sensible defaults for unified approach
-STUDY_NAME=${STUDY_NAME:-unified_$(date +%Y%m%d_%H%M%S)}
-N_TRIALS=${N_TRIALS:-200}            # Fewer trials per worker since each is more expensive
-HPO_MODE=${HPO_MODE:-standard}       # standard | robust
+# CRITICAL: Use SLURM_ARRAY_JOB_ID to ensure all workers share the same study!
+# Or set STUDY_NAME environment variable before submitting the job
+STUDY_NAME=${STUDY_NAME:-unified_standard_v3}
+N_TRIALS=${N_TRIALS:-0}            # Fewer trials per worker since each is more expensive
 SAMPLER=${SAMPLER:-tpe}              # tpe (default for single-objective) | nsga2
 PRUNER=${PRUNER:-hyperband}          # hyperband | median | none
 MAX_EPOCHS=${MAX_EPOCHS:-40}
 NUM_SEEDS_PER_TRIAL=${NUM_SEEDS_PER_TRIAL:-1}
 
-OUTPUT_DIR="slurm_results/hpo_unified_${SLURM_ARRAY_JOB_ID}"
+OUTPUT_DIR="slurm_results/hpo_unified_standard_${SLURM_ARRAY_JOB_ID}"
 mkdir -p "${OUTPUT_DIR}"
 
 echo "=========================================="
-echo "Unified Optuna HPO Worker ${SLURM_ARRAY_TASK_ID}"
+echo "Unified Optuna HPO Worker ${SLURM_ARRAY_TASK_ID} (STANDARD)"
 echo "=========================================="
 echo "Study: ${STUDY_NAME}"
 echo "Mode: ${HPO_MODE}"
@@ -95,16 +95,16 @@ echo "Seeds per trial: ${NUM_SEEDS_PER_TRIAL}"
 echo "Storage: ${OPTUNA_STORAGE}"
 echo "Output: ${OUTPUT_DIR}"
 echo ""
-echo "This worker will explore hyperparameters and evaluate"
-echo "each configuration on multiple datasets (5-10) to find"
-echo "the single best model across all dataset variations."
+echo "This worker will explore architecture/optimizer hyperparameters and evaluate"
+echo "each configuration on a diverse panel of 21 datasets"
+echo "(7 GC × 3 conservation values) to find the single best"
+echo "model across all dataset variations."
 echo "=========================================="
 
 # Persist storage URL for future runs
 echo -n "$OPTUNA_STORAGE" > "$HOME/.optuna_storage_url"
 
-# Run the unified HPO
-# Note: No --array_idx needed since we're not splitting by dataset
+# Run the unified HPO (STANDARD)
 python -u toy_single_arch.py \
   --tune \
   --study-name "${STUDY_NAME}" \
@@ -119,5 +119,7 @@ python -u toy_single_arch.py \
   --output_dir "${OUTPUT_DIR}"
 
 echo ""
-echo "Optuna unified worker ${SLURM_ARRAY_TASK_ID} finished."
+echo "Optuna unified worker ${SLURM_ARRAY_TASK_ID} (STANDARD) finished."
 echo "Results saved to optuna_results/${STUDY_NAME}_unified_mode_${HPO_MODE}/"
+
+

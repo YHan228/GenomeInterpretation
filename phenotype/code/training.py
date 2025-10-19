@@ -1,4 +1,6 @@
 import os
+import sys
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,12 +14,20 @@ import numpy as np
 import matplotlib.pyplot as plt
 from model import SporulationModel, load_best_hparams_from_summary
 
+try:
+    from phenotype_utils import build_labels_map_and_classes, DATA_ROOT
+except ImportError:  # pragma: no cover
+    from .phenotype_utils import build_labels_map_and_classes, DATA_ROOT  # type: ignore
+
 # --- Configuration ---
 SEQ_LEN = 1_000_000
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BASE_DIR = '/vol/projects/BIFO/genomenet/yichen/phenotype/data'
-CSV_PATH = 'sporulation/sporeinfo.csv'
-LOG_DIR = 'slurm_results/sporulation_experiment/tensorboard'
+BASE_DIR = str(DATA_ROOT)
+# Phenotype-agnostic: read labels from the metadata Excel (phenotype column).
+METADATA_XLSX = 'sporulation/microbe.cards table S1.xlsx'
+PHENOTYPE_COL_DEFAULT = 'Spore formation'
+FILE_COL_DEFAULT = 'Fasta file'
+LOG_DIR = 'slurm_results/phenotype_experiment/tensorboard'
 SCHEDULER_PATIENCE = 2
 SCHEDULER_FACTOR = 0.5
 EARLY_STOPPING_PATIENCE = 7
@@ -57,6 +67,53 @@ def one_hot_encode(seq):
             one_hot[mapping[base], i] = 1.0
     return torch.from_numpy(one_hot)
 
+# --- Metadata/labels utilities (phenotype-agnostic) ---
+
+def _norm_basename(val: object) -> str:
+    s = str(val) if not pd.isna(val) else ""
+    s = os.path.basename(s)
+    return s.strip().lower()
+
+def read_metadata_table(xlsx_path: str) -> pd.DataFrame:
+    md = pd.read_excel(xlsx_path)
+    if "Fasta file" not in md.columns:
+        raise ValueError("Expected column 'Fasta file' in metadata Excel")
+    md["Fasta file_norm"] = md["Fasta file"].map(_norm_basename)
+    return md
+
+def _count_labeled_fastas_in_dir(dir_path: str, labels_map: dict) -> int:
+    if not os.path.isdir(dir_path):
+        return 0
+    exts = ('.fasta', '.fa', '.fna')
+    count = 0
+    try:
+        for name in os.listdir(dir_path):
+            if name.endswith(exts):
+                if labels_map.get(str(name).strip().lower()) is not None:
+                    count += 1
+    except Exception:
+        return 0
+    return count
+
+def ensure_data_quality(metadata_df: pd.DataFrame, base_dir: str, phenotype_col: str, file_col: str,
+                        min_train: int = 500, min_val: int = 100, min_test: int = 100) -> None:
+    train_dir = os.path.join(base_dir, 'train')
+    val_dir = os.path.join(base_dir, 'validation')
+    test_dir = os.path.join(base_dir, 'test')
+    labels_map, _classes = build_labels_map_and_classes(
+        metadata_df,
+        phenotype_col=phenotype_col,
+        file_col=file_col,
+        train_dirs=[train_dir],
+    )
+    n_train = _count_labeled_fastas_in_dir(train_dir, labels_map)
+    n_val = _count_labeled_fastas_in_dir(val_dir, labels_map)
+    n_test = _count_labeled_fastas_in_dir(test_dir, labels_map)
+    if (n_train < min_train) or (n_val < min_val) or (n_test < min_test):
+        print(f"[data-quality] Insufficient labeled FASTA counts: train={n_train}, val={n_val}, test={n_test}. "
+              f"Require train>={min_train}, val>={min_val}, test>={min_test}. Aborting.", flush=True)
+        sys.exit(1)
+
 # --- PyTorch Dataset ---
 
 class FastaDataset(Dataset):
@@ -65,9 +122,23 @@ class FastaDataset(Dataset):
     chunk of `seq_len` and one-hot encodes it.
     For validation, sampling is deterministic based on a fixed seed.
     """
-    def __init__(self, data_dir, labels_df, seq_len, epoch_budget=None, is_validation=False):
+    def __init__(self, data_dir, labels_df, seq_len, epoch_budget=None, is_validation=False, phenotype_col: str = PHENOTYPE_COL_DEFAULT, file_col: str = FILE_COL_DEFAULT):
         self.data_dir = data_dir
-        self.labels_map = {row['file']: row['ability_TRUE'] for _, row in labels_df.iterrows()}
+        # Build a mapping from FASTA basename -> class id using metadata Excel
+        try:
+            self.labels_map, self.classes = build_labels_map_and_classes(
+                labels_df,
+                phenotype_col=phenotype_col,
+                file_col=file_col,
+                train_dirs=[Path(BASE_DIR) / "train"],
+            )
+        except Exception:
+            # Fallback for legacy CSV with columns ['file','ability_TRUE']
+            if 'file' in labels_df.columns and 'ability_TRUE' in labels_df.columns:
+                self.labels_map = {str(row['file']).strip().lower(): int(row['ability_TRUE']) for _, row in labels_df.iterrows()}
+                self.classes = sorted(list({0, 1}))
+            else:
+                raise
         self.seq_len = seq_len
         self.is_validation = is_validation
         self.sequences = []
@@ -93,7 +164,7 @@ class FastaDataset(Dataset):
                 print(f"  Processed {i + 1}/{total_files} files...")
 
             file_path = os.path.join(self.data_dir, file_name)
-            label = self.labels_map.get(file_name)
+            label = self.labels_map.get(str(file_name).strip().lower())
             if label is None:
                 continue
 
@@ -263,28 +334,37 @@ def find_lr(model, train_loader, loss_fn, start_lr=1e-8, end_lr=1.0, num_iter=10
 
 # --- Training ---
 
-def train():
+def train(args=None):
     """Main training function."""
     print(f"Using device: {DEVICE}")
 
     # Load labels
-    labels_df = pd.read_csv(CSV_PATH)
+    metadata_xlsx = METADATA_XLSX if args is None or getattr(args, 'metadata_xlsx', None) is None else args.metadata_xlsx
+    phenotype_col = PHENOTYPE_COL_DEFAULT if args is None or getattr(args, 'phenotype_col', None) is None else args.phenotype_col
+    file_col = FILE_COL_DEFAULT if args is None or getattr(args, 'file_col', None) is None else args.file_col
+    metadata_df = read_metadata_table(metadata_xlsx)
+    ensure_data_quality(metadata_df, BASE_DIR, phenotype_col, file_col, min_train=500, min_val=100, min_test=100)
 
     # Create datasets and dataloaders
-    train_dataset = FastaDataset(os.path.join(BASE_DIR, 'train'), labels_df, SEQ_LEN, epoch_budget=EPOCH_BUDGET)
-    val_dataset = FastaDataset(os.path.join(BASE_DIR, 'validation'), labels_df, SEQ_LEN, 
-                               epoch_budget=VAL_EPOCH_BUDGET, is_validation=True)
+    train_dataset = FastaDataset(os.path.join(BASE_DIR, 'train'), metadata_df, SEQ_LEN, epoch_budget=EPOCH_BUDGET, phenotype_col=phenotype_col, file_col=file_col)
+    val_dataset = FastaDataset(os.path.join(BASE_DIR, 'validation'), metadata_df, SEQ_LEN,
+                               epoch_budget=VAL_EPOCH_BUDGET, is_validation=True, phenotype_col=phenotype_col, file_col=file_col)
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_dataset, batch_size=min(BATCH_SIZE, 32), shuffle=False, num_workers=2)
 
-    # Model setup
-    model = SporulationModel(summary_path=_SUMMARY_PATH).to(DEVICE)
-
-    # Calculate class weights for loss function
+    # Determine number of classes from training dataset
     train_labels = [sample['label'] for sample in train_dataset.sequences]
+    num_classes = int(pd.Series(train_labels).nunique()) if len(train_labels) > 0 else 2
+
+    # Model setup
+    summary_path = _SUMMARY_PATH if args is None or getattr(args, 'summary_path', None) is None else args.summary_path
+    model = SporulationModel(summary_path=summary_path, num_classes=num_classes).to(DEVICE)
+
+    # Calculate class weights for loss function (supports multi-class)
     class_counts = pd.Series(train_labels).value_counts().sort_index()
-    class_weights = (len(train_labels) / (2 * class_counts)).values
+    num_classes = max(1, len(class_counts))
+    class_weights = (len(train_labels) / (num_classes * class_counts)).values
     class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
     print(f"Calculated class weights: {class_weights_tensor.cpu().numpy()}")
     
@@ -296,8 +376,10 @@ def train():
     scaler = GradScaler()
     writer = SummaryWriter(LOG_DIR)
     
-    # Ensure model save directory exists
-    os.makedirs('sporulation/model', exist_ok=True)
+    # Ensure model save directory exists (under phenotype, per phenotype slug)
+    phenotype_slug = phenotype_col.strip().lower().replace(' ', '_')
+    model_root = os.path.join('phenotype', 'model', phenotype_slug)
+    os.makedirs(model_root, exist_ok=True)
     
     best_val_loss = float('inf')
     early_stopping_counter = 0
@@ -343,7 +425,7 @@ def train():
             if (best_val_loss - avg_val_loss) > EARLY_STOPPING_MIN_DELTA:
                 best_val_loss = avg_val_loss
                 early_stopping_counter = 0
-                torch.save(model.state_dict(), 'sporulation/model/best_sporulation_model.pth')
+                torch.save(model.state_dict(), os.path.join(model_root, 'best_model.pth'))
                 print(f"  -> New best model saved with val_loss: {best_val_loss:.4f}")
             else:
                 early_stopping_counter += 1
@@ -355,26 +437,30 @@ def train():
              # Still save the best model found during the initial phase
             print(f"  -> New best model saved with val_loss: {avg_val_loss:.4f} (during warmup phase)")
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), 'sporulation/model/best_sporulation_model.pth')
+            torch.save(model.state_dict(), os.path.join(model_root, 'best_model.pth'))
 
     writer.close()
     print("Training finished.")
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description='Train a sporulation prediction model.')
+    parser = argparse.ArgumentParser(description='Train a phenotype-agnostic genome sequence classifier.')
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'find_lr'],
                         help='Set to "find_lr" to run the LR finder, otherwise trains the model.')
+    parser.add_argument('--metadata_xlsx', type=str, default=METADATA_XLSX, help='Path to metadata Excel with phenotype columns')
+    parser.add_argument('--phenotype_col', type=str, default=PHENOTYPE_COL_DEFAULT, help='Phenotype column name to use as label')
+    parser.add_argument('--file_col', type=str, default=FILE_COL_DEFAULT, help='Column containing FASTA filenames')
+    parser.add_argument('--summary_path', type=str, default=_SUMMARY_PATH, help='Optuna summary.txt path for best HPs')
     args = parser.parse_args()
 
     if args.mode == 'find_lr':
         # --- Setup for LR Finder ---
         print(f"Using device: {DEVICE}")
-        labels_df = pd.read_csv(CSV_PATH)
-        train_dataset = FastaDataset(os.path.join(BASE_DIR, 'train'), labels_df, SEQ_LEN)
+        metadata_df = read_metadata_table(args.metadata_xlsx)
+        train_dataset = FastaDataset(os.path.join(BASE_DIR, 'train'), metadata_df, SEQ_LEN, phenotype_col=args.phenotype_col, file_col=args.file_col)
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
         
-        model = SporulationModel(summary_path=_SUMMARY_PATH).to(DEVICE)
+        model = SporulationModel(summary_path=args.summary_path).to(DEVICE)
         
         train_labels = [sample['label'] for sample in train_dataset.sequences]
         class_counts = pd.Series(train_labels).value_counts().sort_index()
@@ -387,4 +473,4 @@ if __name__ == "__main__":
         
         find_lr(model, train_loader, loss_fn)
     else:
-        train()
+        train(args)

@@ -154,13 +154,13 @@ SEARCH_SPACE = {
             'epsilon': {'low': 1e-3, 'high': 0.5, 'log': True}
         },
         'gaussian_smoothing': {
-            'sigma2': {'low': 1e-5, 'high': 0.1, 'log': True}
+            'sigma2': {'low': 1e-5, 'high': 0.2, 'log': True}
         },
         'hotflip': {
-            'max_flip_fraction': {'low': 1e-3, 'high': 0.2, 'log': True}
+            'max_flip_fraction': {'low': 1e-3, 'high': 0.3, 'log': True}
         },
         'direct_hotflip': {
-            'max_flip_fraction': {'low': 1e-3, 'high': 0.2, 'log': True}
+            'max_flip_fraction': {'low': 1e-3, 'high': 0.5, 'log': True}
         }
     }
 }
@@ -255,21 +255,11 @@ to_ix = {b: i for i, b in enumerate(ALPH)}
 
 def log_gpu_stats(prefix=""):
     """Log GPU utilization and memory usage."""
-    if torch.cuda.is_available():
-        # Get memory stats
-        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-        reserved = torch.cuda.memory_reserved() / 1024**3    # GB
-        
-        # Try to get utilization if pynvml is available
-        try:
-            import pynvml
-            pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            gpu_util = util.gpu
-            print(f"{prefix}GPU: {gpu_util}% util, {allocated:.2f}GB/{reserved:.2f}GB mem")
-        except:
-            print(f"{prefix}GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+    # Disabled for less verbose output - uncomment if debugging GPU issues
+    # if torch.cuda.is_available():
+    #     allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+    #     reserved = torch.cuda.memory_reserved() / 1024**3    # GB
+    #     print(f"{prefix}GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
     return
 
 
@@ -502,7 +492,7 @@ NEG_N = N_TOTAL - POS_N
 
 def generate_dataset(gc_pos: float, conservation: float):
     """Generates the main dataset based on global config."""
-    print(f"Generating dataset with GC_POS={gc_pos:.2f} and conservation={conservation:.2f}...")
+    # Silent dataset generation
     GC_NEG = 0.50
 
     X, y, masks = [], [], []
@@ -697,7 +687,7 @@ def compute_validation_accuracy(model, loader, dev) -> float:
 
 
 def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, scaler, writer, scheduler, epochs: int = 10, early_stopping_patience: int = 15, early_stopping_min_delta: float = 1e-4, trial=None, grad_clip: float = 5.0, trial_step_offset: int = 0) -> None:
-    print(f"Starting standard training with early stopping (patience={early_stopping_patience}, min_delta={early_stopping_min_delta})...")
+    # Reduced verbosity: removed initial print
     best_val_loss = float('inf')
     early_stopping_counter = 0
 
@@ -738,16 +728,17 @@ def train_standard(model, train_loader, val_loader, loss_fn, optimizer, dev, sca
         writer.add_scalar('Accuracy/validation', val_acc, epoch)
         writer.add_scalar('LR/train', scheduler.optimizer.param_groups[0]['lr'], epoch)
         
-        # Compute and log effect sizes every 5 epochs (to avoid bottlenecks)
-        if epoch % 5 == 0:
-            gc_eff, motif_eff, ratio = compute_effect_sizes_fast(model, val_loader, dev, n_samples=50)
-            writer.add_scalar('EffectSize/gc_effect', gc_eff, epoch)
-            writer.add_scalar('EffectSize/motif_effect', motif_eff, epoch)
-            writer.add_scalar('EffectSize/effect_ratio', ratio, epoch)
-            print(f"  Epoch {epoch + 1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, GC Effect: {gc_eff:.3f}, Motif Effect: {motif_eff:.3f}, Ratio: {ratio:.2f}")
-            log_gpu_stats("    ")
-        else:
-            print(f"  Epoch {epoch + 1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        # Log progress every 10 epochs (reduced from every epoch)
+        if epoch % 10 == 0 or epoch == epochs - 1 or early_stopping_counter >= early_stopping_patience - 1:
+            # Compute effect sizes only when logging
+            if epoch % 10 == 0 and epoch > 0:
+                gc_eff, motif_eff, ratio = compute_effect_sizes_fast(model, val_loader, dev, n_samples=50)
+                writer.add_scalar('EffectSize/gc_effect', gc_eff, epoch)
+                writer.add_scalar('EffectSize/motif_effect', motif_eff, epoch)
+                writer.add_scalar('EffectSize/effect_ratio', ratio, epoch)
+                print(f"  Epoch {epoch + 1}: Loss={avg_val_loss:.4f}, Acc={val_acc:.3f}")
+            else:
+                print(f"  Epoch {epoch + 1}: Loss={avg_val_loss:.4f}, Acc={val_acc:.3f}")
         
         # Optuna pruning hook
         if trial is not None and optuna is not None:
@@ -802,7 +793,7 @@ def train_random_smoothing(model, train_loader, val_loader, loss_fn, optimizer, 
                            target_epsilon: float, epochs: int = 10, early_stopping_patience: int = 10, early_stopping_min_delta: float = 1e-4, trial=None, grad_clip: float = 5.0, trial_step_offset: int = 0) -> None:
     
     dirichlet_concentration = concentration_from_epsilon(target_epsilon)
-    print(f"Starting randomized smoothing training with target epsilon = {target_epsilon:.4f} (Dirichlet conc = {dirichlet_concentration:.2f}) and early stopping (patience={early_stopping_patience}, min_delta={early_stopping_min_delta})...")
+    # Reduced verbosity
     best_val_loss = float('inf')
     early_stopping_counter = 0
     
@@ -840,7 +831,9 @@ def train_random_smoothing(model, train_loader, val_loader, loss_fn, optimizer, 
         writer.add_scalar('Loss/validation_random_smoothing', avg_val_loss, epoch)
         writer.add_scalar('Accuracy/validation_random_smoothing', val_acc, epoch)
         writer.add_scalar('LR/train_random_smoothing', scheduler.optimizer.param_groups[0]['lr'], epoch)
-        print(f"  Epoch {epoch + 1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Target Epsilon: {target_epsilon:.4f}")
+        # Log every 10 epochs
+        if epoch % 10 == 0 or epoch == epochs - 1:
+            print(f"  Epoch {epoch + 1}: Loss={avg_val_loss:.4f}, Acc={val_acc:.3f}")
 
         # Optuna pruning hook
         if trial is not None and optuna is not None:
@@ -2054,11 +2047,16 @@ def run_study(args):
     else:
         pruner = None
 
-    # Single unified study for all datasets
-    study_name_actual = f"{args.study_name}_unified_mode_{args.mode}"
+    # Study naming
+    if args.mode == 'robust' and getattr(args, 'dataset_gc', None) is not None and getattr(args, 'dataset_cons', None) is not None:
+        # Per-dataset robust study (unique per dataset)
+        study_name_actual = f"{args.study_name}_gc{float(args.dataset_gc):.3f}_cons{float(args.dataset_cons):.2f}_mode_robust"
+    else:
+        # Unified naming (standard or generic robust)
+        study_name_actual = f"{args.study_name}_unified_mode_{args.mode}"
     
     try:
-        print(f"[HPO] Creating/connecting unified study: {study_name_actual}")
+        print(f"[HPO] Creating/connecting study: {study_name_actual}")
         study = optuna.create_study(
             directions=directions,
             sampler=sampler,
@@ -2074,12 +2072,11 @@ def run_study(args):
         sys.exit(1)
 
     # Pre-load ALL datasets to minimize I/O
-    print(f"[HPO] Pre-loading all {len(GC_HPARAMS) * len(CONS_HPARAMS)} dataset combinations...")
+    print(f"[HPO] Loading {len(GC_HPARAMS) * len(CONS_HPARAMS)} datasets...")
     all_datasets = {}
     for gc_val in GC_HPARAMS:
         for cons_val in CONS_HPARAMS:
             all_datasets[(gc_val, cons_val)] = load_or_generate_dataset(gc_pos=gc_val, conservation=cons_val)
-    print(f"[HPO] All datasets loaded.")
 
     # SLURM usage examples
     # Example SLURM usage (parallel workers share the same study/storage):
@@ -2091,6 +2088,44 @@ def run_study(args):
     #     --wrap='python toy_slurm.py --tune --study-name tinycnn_gc055 --n-trials 400 --mode standard'
 
     max_epochs = args.max_epochs or args.epochs or 40
+
+    # Resolve robust architecture from summary if provided
+    robust_arch = None
+    if args.mode == 'robust' and getattr(args, 'robust_arch_from_summary', None):
+        try:
+            with open(args.robust_arch_from_summary, 'r') as f:
+                _summary = json.load(f)
+            _top = None
+            top_list = _summary.get('top10_by_saliency_auc') or []
+            if top_list:
+                _top = top_list[0]
+            if _top is None:
+                best = _summary.get('best_trial')
+                if isinstance(best, dict):
+                    _top = {'params': best}
+            if _top and isinstance(_top, dict):
+                p = dict(_top.get('params', {}))
+                robust_arch = {
+                    'k1': int(p.get('k1', 21)),
+                    'k2': int(p.get('k2', 7)),
+                    'k3': int(p.get('k3', 7)),
+                    'c1': int(p.get('c1', 64)),
+                    'c2': int(p.get('c2', 128)),
+                    'c3': int(p.get('c3', 192)),
+                    'pool_w': int(p.get('pool_w', 50)),
+                    'act1': str(p.get('act1', 'exp')),
+                    'drop_conv1': float(p.get('drop_conv1', 0.1)),
+                    'drop_conv2': float(p.get('drop_conv2', 0.1)),
+                    'drop_conv3': float(p.get('drop_conv3', 0.1)),
+                    'drop_fc': float(p.get('drop_fc', 0.5)),
+                }
+                # Ensure odd kernels
+                for k in ['k1','k2','k3']:
+                    if robust_arch[k] % 2 == 0:
+                        robust_arch[k] = robust_arch[k] + 1
+        except Exception as e:
+            print(f"[HPO] Warning: failed to load robust architecture from summary: {e}")
+            robust_arch = None
 
     def objective(trial: 'optuna.trial.Trial'):
         # ---------------- Hyperparameters ----------------
@@ -2105,20 +2140,19 @@ def run_study(args):
         # In robust mode, we could still optimize architecture or use fixed defaults
         # For now, we'll use reasonable fixed defaults for robust mode
         if mode == 'robust':
-            # Fixed architecture for robust mode testing
-            k1 = 21
-            k2 = 7
-            k3 = 7
-            c1 = 64
-            c2 = 128
-            c3 = 192
-            pool_w = 50
-            act1 = 'exp'
-            drop_conv1 = 0.1
-            drop_conv2 = 0.1
-            drop_conv3 = 0.1
-            drop_fc = 0.5
-            
+            # Use architecture from summary (Top-1 of standard) if available; otherwise fallback defaults
+            if robust_arch is not None:
+                k1 = robust_arch['k1']; k2 = robust_arch['k2']; k3 = robust_arch['k3']
+                c1 = robust_arch['c1']; c2 = robust_arch['c2']; c3 = robust_arch['c3']
+                pool_w = robust_arch['pool_w']; act1 = robust_arch['act1']
+                drop_conv1 = robust_arch['drop_conv1']; drop_conv2 = robust_arch['drop_conv2']
+                drop_conv3 = robust_arch['drop_conv3']; drop_fc = robust_arch['drop_fc']
+            else:
+                k1 = 21; k2 = 7; k3 = 7
+                c1 = 64; c2 = 128; c3 = 192
+                pool_w = 50; act1 = 'exp'
+                drop_conv1 = 0.1; drop_conv2 = 0.1; drop_conv3 = 0.1; drop_fc = 0.5
+
             optimizer_name = 'adamw'
             lr = 5e-4
             weight_decay = 1e-5
@@ -2177,16 +2211,35 @@ def run_study(args):
         seed_base = 1000 + trial.number * 17
         num_seeds = max(1, int(args.num_seeds_per_trial))
 
-        # Sample datasets for evaluation (use all for final trials, subset for early exploration)
-        # For efficiency, we can sample a subset of datasets during optimization
-        num_datasets_to_eval = min(5, len(all_datasets))  # Start with 5 random datasets
-        if trial.number > 50:  # After 50 trials, evaluate on more datasets
-            num_datasets_to_eval = min(10, len(all_datasets))
-        
+        # Dataset selection based on eval_mode
         dataset_keys = list(all_datasets.keys())
-        import random
-        random.seed(trial.number)  # Ensure reproducibility
-        eval_dataset_keys = random.sample(dataset_keys, num_datasets_to_eval)
+        
+        if args.mode == 'robust' and getattr(args, 'dataset_gc', None) is not None and getattr(args, 'dataset_cons', None) is not None:
+            # Single-dataset robust study
+            eval_dataset_keys = [(float(args.dataset_gc), float(args.dataset_cons))]
+        elif args.eval_mode == 'panel':
+            # Fixed diverse panel: balanced across GC and conservation ranges
+            panel_gc = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]  # 7 GC values
+            panel_cons = [0.6, 0.7, 0.8]  # 3 conservation values
+            eval_dataset_keys = [(gc, cons) for gc in panel_gc for cons in panel_cons 
+                                 if (gc, cons) in all_datasets]
+            # If panel is incomplete, add closest available
+            if len(eval_dataset_keys) < 21:
+                eval_dataset_keys = dataset_keys[:21]  # Fallback to first 21
+        elif args.eval_mode == 'all':
+            eval_dataset_keys = dataset_keys
+        elif args.eval_mode == 'progressive':
+            # Start small, grow with trial number
+            n_start = 10
+            n_max = len(dataset_keys)
+            growth_rate = 0.5  # Add 50% more datasets every 20 trials
+            n_datasets = min(n_max, int(n_start * (1 + growth_rate * (trial.number // 20))))
+            import random
+            random.seed(42)  # Fixed seed for consistent progressive sampling
+            eval_dataset_keys = random.sample(dataset_keys, n_datasets)
+        else:
+            # Default fallback
+            eval_dataset_keys = dataset_keys[:10]
         
         # Create per-trial TB dir
         tb_root = os.path.join(args.output_dir, 'tensorboard_optuna', f"study_{study_name_actual}", f"trial_{trial.number}")
@@ -2201,11 +2254,19 @@ def run_study(args):
 
         # Collect metrics across all evaluated datasets
         all_val_acc_list, all_sal_auc_list = [], []
-
+        all_wiou_list, all_snr_list = [], []
+        
+        # Track dataset-level failures for sophisticated pruning
+        dataset_failures = 0  # Count datasets where model fails early
+        FAILURE_THRESHOLD = 3  # Prune if this many datasets fail
+        EPOCHS_FOR_FAILURE_CHECK = 10  # Give each dataset this many epochs before declaring failure
+        failure_auc_threshold = 0.55  # Default threshold for failure detection
         # Evaluate model on multiple datasets
         for ds_idx, (gc_val, cons_val) in enumerate(eval_dataset_keys):
             dataset_sal_auc_list = []
             dataset_val_acc_list = []
+            dataset_wiou_list = []
+            dataset_snr_list = []
             
             main_dataset = all_datasets[(gc_val, cons_val)]
             
@@ -2247,45 +2308,70 @@ def run_study(args):
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', factor=0.5, patience=8, verbose=False)
 
                 # Train according to regime
+                dataset_failed = False  # Track if this dataset-seed combo failed
                 try:
                     # Unique Optuna step offset to avoid collisions across datasets/seeds
                     step_span = int(max_epochs) + 5
                     trial_step_offset = ((ds_idx * num_seeds) + seed_idx) * step_span
+                    
+                    # For sophisticated pruning, use shorter patience for early datasets
+                    # This allows us to fail fast on bad hyperparameters
+                    if ds_idx < FAILURE_THRESHOLD:
+                        effective_max_epochs = min(EPOCHS_FOR_FAILURE_CHECK, max_epochs)
+                    else:
+                        effective_max_epochs = max_epochs
+                    
                     if mode == 'standard':
                         train_standard(model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler,
-                                       epochs=max_epochs, early_stopping_patience=15, trial=trial, grad_clip=float(grad_clip), trial_step_offset=trial_step_offset)
+                                       epochs=effective_max_epochs, early_stopping_patience=15, trial=trial, grad_clip=float(grad_clip), trial_step_offset=trial_step_offset)
                     elif mode == 'robust' and regime == 'random_smoothing' and epsilon is not None:
                         train_random_smoothing(model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler,
-                                               target_epsilon=float(epsilon), epochs=max_epochs, early_stopping_patience=10, trial=trial, grad_clip=float(grad_clip), trial_step_offset=trial_step_offset)
+                                               target_epsilon=float(epsilon), epochs=effective_max_epochs, early_stopping_patience=10, trial=trial, grad_clip=float(grad_clip), trial_step_offset=trial_step_offset)
                     elif mode == 'robust' and regime == 'gaussian_smoothing' and epsilon is not None:
                         train_gaussian_smoothing(model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler,
-                                                 sigma2=float(epsilon), epochs=max_epochs, early_stopping_patience=10, trial=trial, grad_clip=float(grad_clip), trial_step_offset=trial_step_offset)
+                                                 sigma2=float(epsilon), epochs=effective_max_epochs, early_stopping_patience=10, trial=trial, grad_clip=float(grad_clip), trial_step_offset=trial_step_offset)
                     elif mode == 'robust' and regime == 'hotflip' and max_flip_fraction is not None:
                         train_hotflip(model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler,
-                                      max_flip_fraction=float(max_flip_fraction), epochs=max_epochs, use_scheduling=(schedule_choice=="on"), early_stopping_patience=25, gc_pos=gc_val, trial=trial, grad_clip=float(grad_clip), trial_step_offset=trial_step_offset)
+                                      max_flip_fraction=float(max_flip_fraction), epochs=effective_max_epochs, use_scheduling=(schedule_choice=="on"), early_stopping_patience=25, gc_pos=gc_val, trial=trial, grad_clip=float(grad_clip), trial_step_offset=trial_step_offset)
                     elif mode == 'robust' and regime == 'direct_hotflip' and max_flip_fraction is not None:
                         train_direct_hotflip(model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler,
-                                             max_flip_fraction=float(max_flip_fraction), epochs=max_epochs, use_scheduling=(schedule_choice=="on"), early_stopping_patience=25, gc_pos=gc_val, trial=trial, grad_clip=float(grad_clip), trial_step_offset=trial_step_offset)
+                                             max_flip_fraction=float(max_flip_fraction), epochs=effective_max_epochs, use_scheduling=(schedule_choice=="on"), early_stopping_patience=25, gc_pos=gc_val, trial=trial, grad_clip=float(grad_clip), trial_step_offset=trial_step_offset)
                     else:
                         raise ValueError(f"Unsupported configuration or missing params: mode={mode}, regime={regime}")
+                except optuna.TrialPruned:
+                    # This dataset-seed was pruned early
+                    dataset_failed = True
+                    print(f"  Dataset gc={gc_val:.3f}, cons={cons_val:.2f}, seed={seed}: PRUNED by Optuna")
                 finally:
                     writer.flush(); writer.close()
 
-                # Validation accuracy
-                val_acc = compute_validation_accuracy(model, val_dl, dev)
+                # Only evaluate if training didn't fail
+                if not dataset_failed:
+                    # Validation accuracy
+                    val_acc = compute_validation_accuracy(model, val_dl, dev)
 
-                # Saliency AUC on validation set (reuse evaluation pipeline on val loader)
-                try:
-                    wio, _, sal_auc, _, _ = evaluate_model(model, val_dl, dev, pgd_cache={})
-                except Exception as e:
-                    print(f"Saliency AUC computation failed: {e}")
-                    sal_auc = 0.0  # Default value on failure
-                
-                dataset_val_acc_list.append(val_acc)
-                dataset_sal_auc_list.append(float(sal_auc))
+                    # Saliency AUC on validation set (reuse evaluation pipeline on val loader)
+                    try:
+                        wio, _, sal_auc, snr, _ = evaluate_model(model, val_dl, dev, pgd_cache={})
+                    except Exception as e:
+                        print(f"Saliency AUC computation failed: {e}")
+                        sal_auc = 0.0  # Default value on failure
+                        wio = 0.0
+                        snr = 0.0
+                    
+                    dataset_val_acc_list.append(val_acc)
+                    dataset_sal_auc_list.append(float(sal_auc))
+                    dataset_wiou_list.append(float(wio))
+                    dataset_snr_list.append(float(snr))
+                else:
+                    # Failed dataset-seed gets poor metrics
+                    dataset_val_acc_list.append(0.5)  # Random chance
+                    dataset_sal_auc_list.append(0.5)  # Random chance
+                    dataset_wiou_list.append(0.0)
+                    dataset_snr_list.append(0.0)
 
                 # Save minimal artifacts
-                if artifacts_dir:
+                if artifacts_dir and not dataset_failed:
                     params_path = os.path.join(artifacts_dir, f"gc{gc_val:.3f}_cons{cons_val:.2f}_seed_{seed}_params.json")
                     metrics_path = os.path.join(artifacts_dir, f"gc{gc_val:.3f}_cons{cons_val:.2f}_seed_{seed}_metrics.json")
                     with open(params_path, 'w') as f:
@@ -2304,32 +2390,64 @@ def run_study(args):
             # Aggregate across seeds for this dataset
             dataset_val_acc_mean = float(np.mean(dataset_val_acc_list))
             dataset_sal_auc_mean = float(np.mean(dataset_sal_auc_list))
+            dataset_wiou_mean = float(np.mean(dataset_wiou_list)) if dataset_wiou_list else 0.0
+            dataset_snr_mean = float(np.mean(dataset_snr_list)) if dataset_snr_list else 0.0
             
-            # Add to overall lists
+            # Check if this dataset "failed" (poor performance after limited epochs)
+            if ds_idx < FAILURE_THRESHOLD and dataset_sal_auc_mean < failure_auc_threshold:  # Near random
+                dataset_failures += 1
+                
+                # Check if we should prune the entire trial
+                if dataset_failures >= FAILURE_THRESHOLD:
+                    print(f"[Trial {trial.number}] Pruning: {dataset_failures} datasets failed (AUC<0.55)")
+                    # Record the failure metrics before pruning
+                    trial.set_user_attr('pruned_after_datasets', ds_idx + 1)
+                    trial.set_user_attr('dataset_failures', dataset_failures)
+                    raise optuna.TrialPruned()
+            # Add to overall lists and persist per-dataset user attrs for robust studies
             all_val_acc_list.append(dataset_val_acc_mean)
             all_sal_auc_list.append(dataset_sal_auc_mean)
-            
-            print(f"  Dataset gc={gc_val:.3f}, cons={cons_val:.2f}: Val Acc={dataset_val_acc_mean:.3f}, Saliency AUC={dataset_sal_auc_mean:.3f}")
+            all_wiou_list.append(dataset_wiou_mean)
+            all_snr_list.append(dataset_snr_mean)
+            try:
+                trial.set_user_attr(f"wiou_gc{gc_val:.3f}_cons{cons_val:.2f}", dataset_wiou_mean)
+                trial.set_user_attr(f"saliency_snr_gc{gc_val:.3f}_cons{cons_val:.2f}", dataset_snr_mean)
+                # Save per-dataset core metrics for downstream analysis in trials.csv
+                trial.set_user_attr(f"val_acc_gc{gc_val:.3f}_cons{cons_val:.2f}", dataset_val_acc_mean)
+                trial.set_user_attr(f"saliency_auc_gc{gc_val:.3f}_cons{cons_val:.2f}", dataset_sal_auc_mean)
+            except Exception:
+                pass
 
         # Aggregate across all datasets - this is our final metric
         overall_val_acc_mean = float(np.mean(all_val_acc_list)) if all_val_acc_list else 0.0
         overall_sal_auc_mean = float(np.mean(all_sal_auc_list)) if all_sal_auc_list else 0.0
+        overall_wiou_mean = float(np.mean(all_wiou_list)) if all_wiou_list else 0.0
+        overall_snr_mean = float(np.mean(all_snr_list)) if all_snr_list else 0.0
         
-        print(f"[Trial {trial.number}] Overall metrics across {len(eval_dataset_keys)} datasets: Val Acc={overall_val_acc_mean:.3f}, Saliency AUC={overall_sal_auc_mean:.3f}")
+        # Compute weighted objective for logging
+        weighted_objective = 0.9 * overall_sal_auc_mean + 0.1 * overall_val_acc_mean
+        print(f"[Trial {trial.number}] Metrics: Acc={overall_val_acc_mean:.3f}, AUC={overall_sal_auc_mean:.3f}, Obj={weighted_objective:.3f}")
         
         # Store in user attrs for downstream filtering
         trial.set_user_attr('val_acc', overall_val_acc_mean)
         trial.set_user_attr('saliency_auc', overall_sal_auc_mean)
+        trial.set_user_attr('wiou_mean', overall_wiou_mean)
+        trial.set_user_attr('saliency_snr_mean', overall_snr_mean)
         trial.set_user_attr('num_datasets_evaluated', len(eval_dataset_keys))
 
-        # Return single objective: maximize average Saliency AUC across all datasets
-        return overall_sal_auc_mean
+        # Return weighted objective: 0.9 * Saliency AUC + 0.1 * Val Accuracy
+        # This encourages models that both identify the right features (AUC) and classify well (Acc)
+        weighted_objective = 0.9 * overall_sal_auc_mean + 0.1 * overall_val_acc_mean
+        return weighted_objective
 
     study.optimize(objective, n_trials=args.n_trials, n_jobs=1)
 
     # ---------------- Post-processing ----------------
-    # Save results under the unified study name
-    out_dir = os.path.join('optuna_results', study_name_actual)
+    # Save results; dataset-specific directory for robust per-dataset studies
+    if args.mode == 'robust' and getattr(args, 'dataset_gc', None) is not None and getattr(args, 'dataset_cons', None) is not None:
+        out_dir = os.path.join('optuna_results', f"{args.study_name}_gc{float(args.dataset_gc):.3f}_cons{float(args.dataset_cons):.2f}_mode_robust")
+    else:
+        out_dir = os.path.join('optuna_results', study_name_actual)
     os.makedirs(out_dir, exist_ok=True)
     try:
         df = study.trials_dataframe(attrs=("number","value","params","state","duration","user_attrs"))
@@ -2347,13 +2465,22 @@ def run_study(args):
     for t in completed:
         sa = t.value if t.value is not None else t.user_attrs.get('saliency_auc', 0.0)
         va = t.user_attrs.get('val_acc', 0.0)
+        wi_m = t.user_attrs.get('wiou_mean', None)
+        snr_m = t.user_attrs.get('saliency_snr_mean', None)
         num_datasets = t.user_attrs.get('num_datasets_evaluated', 0)
+        # Extract any saved per-dataset attrs
+        wiou_attrs = {k: v for k, v in t.user_attrs.items() if isinstance(k, str) and k.startswith('wiou_')}
+        snr_attrs = {k: v for k, v in t.user_attrs.items() if isinstance(k, str) and (k.startswith('snr_') or k.startswith('saliency_snr_'))}
         best_trials.append({
             'number': t.number,
             'val_acc': float(va),
             'saliency_auc': float(sa),
+            'wiou_mean': float(wi_m) if wi_m is not None else None,
+            'saliency_snr_mean': float(snr_m) if snr_m is not None else None,
             'num_datasets_evaluated': num_datasets,
-            'params': t.params
+            'params': t.params,
+            'wiou_attrs': wiou_attrs,
+            'snr_attrs': snr_attrs,
         })
     
     # Sort by Saliency AUC
@@ -2376,6 +2503,9 @@ def run_study(args):
         'best_trial': study.best_trial.params if study.best_trial else None,
         'best_value': study.best_value if hasattr(study, 'best_value') else None,
     }
+    # Attach dataset metadata for robust per-dataset
+    if args.mode == 'robust' and getattr(args, 'dataset_gc', None) is not None and getattr(args, 'dataset_cons', None) is not None:
+        summary['dataset'] = {'gc_pos': float(args.dataset_gc), 'conservation': float(args.dataset_cons)}
     with open(os.path.join(out_dir, 'summary.json'), 'w') as f:
         json.dump(summary, f, indent=2)
 
@@ -2491,6 +2621,182 @@ def run_reval_trial(args):
     print(f"Re-evaluated Trial {trial.number} over {seeds} seeds: Acc={acc_m:.3f}±{acc_se:.3f}, SaliencyAUC={auc_m:.3f}±{auc_se:.3f}")
 
     return {'trial': trial.number, 'acc_mean': acc_m, 'acc_se': acc_se, 'auc_mean': auc_m, 'auc_se': auc_se}
+
+def refit_from_summary(args):
+    """
+    Refit top-K models (by Saliency AUC) from an Optuna summary.json across all 65 datasets.
+
+    This does NOT require live Optuna storage; it reads param dicts from summary.json.
+    Writes per-model results to JSON under an output directory and prints concise progress.
+    """
+    summary_path = args.refit_from_summary
+    if summary_path is None or not os.path.exists(summary_path):
+        print(f"refit_from_summary: summary file not found: {summary_path}")
+        return
+
+    with open(summary_path, 'r') as f:
+        summary_data = json.load(f)
+
+    top_list = summary_data.get('top10_by_saliency_auc', [])
+    if not top_list:
+        print("refit_from_summary: No 'top10_by_saliency_auc' entries in summary.json")
+        return
+
+    top_k = max(1, int(getattr(args, 'top_k', 3)))
+    selected = top_list[:top_k]
+
+    # Output directory
+    if getattr(args, 'refit_output_dir', None):
+        out_root = args.refit_output_dir
+    else:
+        out_root = os.path.join(os.path.dirname(os.path.abspath(summary_path)), f"refit_top{top_k}")
+    os.makedirs(out_root, exist_ok=True)
+
+    # Prepare all datasets (65 combinations)
+    dataset_keys = [(gc, cons) for gc in GC_HPARAMS for cons in CONS_HPARAMS]
+    print(f"[Refit] Will evaluate top-{top_k} models across {len(dataset_keys)} datasets (all GC×Conservation).")
+
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    bce = nn.BCEWithLogitsLoss()
+    seeds = max(1, int(getattr(args, 'reval_seeds', 5)))
+    epochs_eff = int(getattr(args, 'max_epochs', None) or getattr(args, 'epochs', 40))
+
+    overall_summary = {
+        'source_summary': os.path.abspath(summary_path),
+        'top_k': top_k,
+        'seeds': seeds,
+        'epochs': epochs_eff,
+        'results': []
+    }
+
+    for rank, entry in enumerate(selected, start=1):
+        params = dict(entry.get('params', {}))
+        model_dir = os.path.join(out_root, f"model_rank_{rank}")
+        os.makedirs(model_dir, exist_ok=True)
+
+        # Use trial-suggested train batch size if provided
+        train_bs = int(params.get('train_batch_size', TRAIN_BATCH_SIZE))
+
+        per_dataset_results = []
+
+        for gc_val, cons_val in dataset_keys:
+            # Load or create dataset once per dataset key
+            main_dataset = load_or_generate_dataset(gc_pos=gc_val, conservation=cons_val)
+
+            # Accumulate per-seed metrics
+            seed_metrics = []
+            for seed_idx in range(seeds):
+                seed_value = 4242 + seed_idx
+                set_seeds(seed_value, deterministic=getattr(args, 'deterministic', False))
+
+                train_dl, val_dl, _ = _make_dataloaders_for_hpo(
+                    main_dataset, seed=seed_value, train_batch_size=train_bs, eval_batch_size=DEFAULT_EVAL_BATCH_SIZE
+                )
+
+                # Build model and optimizer from params
+                model = _build_model_from_params(params).to(dev)
+                if hasattr(torch, "compile"):
+                    try:
+                        model = torch.compile(model)
+                    except Exception:
+                        pass
+
+                optimizer_name = params.get('optimizer', 'adamw')
+                lr = float(params.get('lr', 3e-4))
+                weight_decay = float(params.get('weight_decay', 1e-6))
+                grad_clip = float(params.get('grad_clip', 5.0))
+                if optimizer_name == 'adamw':
+                    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+                else:
+                    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.0)
+
+                writer = make_writer(log_dir=os.path.join(model_dir, f"gc{gc_val:.3f}_cons{cons_val:.2f}", f"seed_{seed_value}"))
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, 'min', factor=0.5, patience=8, verbose=False)
+                scaler = GradScaler()
+
+                # Train (standard mode)
+                train_standard(
+                    model, train_dl, val_dl, bce, opt, dev, scaler, writer, scheduler,
+                    epochs=epochs_eff, early_stopping_patience=15, trial=None, grad_clip=grad_clip
+                )
+                writer.flush(); writer.close()
+
+                # Evaluate on validation set
+                val_acc = compute_validation_accuracy(model, val_dl, dev)
+                try:
+                    wiou, _, sal_auc, sal_snr, pgd_stats = evaluate_model(model, val_dl, dev, pgd_cache={})
+                except Exception as e:
+                    print(f"Eval failed (gc={gc_val:.3f}, cons={cons_val:.2f}, seed={seed_value}): {e}")
+                    wiou, sal_auc, sal_snr = 0.0, 0.0, 0.0
+                    pgd_stats = {"pgd_success_rate": 0.0, "pgd_mean_iters_to_flip": 0.0}
+
+                seed_metrics.append({
+                    'seed': seed_value,
+                    'val_acc': float(val_acc),
+                    'wIoU': float(wiou),
+                    'saliency_auc': float(sal_auc),
+                    'saliency_snr': float(sal_snr),
+                    'pgd': pgd_stats,
+                })
+
+            # Aggregate across seeds for this dataset
+            def mean_se(values):
+                arr = np.array(values, dtype=float)
+                if arr.size == 0:
+                    return 0.0, 0.0
+                mean_val = float(arr.mean())
+                se_val = float(arr.std(ddof=1) / np.sqrt(arr.size)) if arr.size > 1 else 0.0
+                return mean_val, se_val
+
+            acc_m, acc_se = mean_se([m['val_acc'] for m in seed_metrics])
+            auc_m, auc_se = mean_se([m['saliency_auc'] for m in seed_metrics])
+            wiou_m, wiou_se = mean_se([m['wIoU'] for m in seed_metrics])
+            snr_m, snr_se = mean_se([m['saliency_snr'] for m in seed_metrics])
+
+            per_dataset_results.append({
+                'gc': float(gc_val),
+                'conservation': float(cons_val),
+                'seeds': seed_metrics,
+                'agg': {
+                    'val_acc_mean': acc_m, 'val_acc_se': acc_se,
+                    'saliency_auc_mean': auc_m, 'saliency_auc_se': auc_se,
+                    'wIoU_mean': wiou_m, 'wIoU_se': wiou_se,
+                    'saliency_snr_mean': snr_m, 'saliency_snr_se': snr_se,
+                }
+            })
+
+        # Overall aggregates across datasets (means of dataset means)
+        def agg_over_datasets(key):
+            vals = [d['agg'][key] for d in per_dataset_results]
+            return float(np.mean(vals)) if vals else 0.0
+
+        overall_aggs = {
+            'datasets_evaluated': len(per_dataset_results),
+            'val_acc_mean_over_datasets': agg_over_datasets('val_acc_mean'),
+            'saliency_auc_mean_over_datasets': agg_over_datasets('saliency_auc_mean'),
+            'wIoU_mean_over_datasets': agg_over_datasets('wIoU_mean'),
+            'saliency_snr_mean_over_datasets': agg_over_datasets('saliency_snr_mean'),
+        }
+
+        # Persist per-model results
+        model_result = {
+            'rank': rank,
+            'trial_number': entry.get('number'),
+            'params': params,
+            'overall': overall_aggs,
+            'per_dataset': per_dataset_results,
+        }
+        overall_summary['results'].append(model_result)
+
+        with open(os.path.join(model_dir, 'refit_results.json'), 'w') as f:
+            json.dump(model_result, f, indent=2)
+
+        print(f"[Refit] Model rank {rank}: AUC_over_datasets={overall_aggs['saliency_auc_mean_over_datasets']:.3f}, Acc_over_datasets={overall_aggs['val_acc_mean_over_datasets']:.3f}")
+
+    # Save master summary
+    with open(os.path.join(out_root, 'refit_summary.json'), 'w') as f:
+        json.dump(overall_summary, f, indent=2)
+    print(f"[Refit] Finished. Results saved to: {out_root}")
 
 def run_experiment_combo(args, combo: dict):
     """
@@ -2715,6 +3021,14 @@ if __name__ == "__main__":
     parser.add_argument("--artifacts-dir", type=str, default=CONFIG['paths']['artifacts_dir'], help="Directory for trial artifacts.")
     parser.add_argument("--reval-trial", type=int, default=None, help="Retrain a specific trial's params for K seeds and report mean±SE.")
     parser.add_argument("--reval-seeds", type=int, default=5, help="Number of seeds for re-evaluation.")
+    # Refit top-K models from summary.json
+    parser.add_argument("--refit-from-summary", type=str, default=None, help="Path to Optuna summary.json whose top-K models will be refit across all datasets.")
+    parser.add_argument("--top-k", type=int, default=3, help="How many top trials (by Saliency AUC) to refit.")
+    parser.add_argument("--refit-output-dir", type=str, default=None, help="Directory to write refit results. Defaults next to the summary.json.")
+    # Robust per-dataset extras
+    parser.add_argument("--robust-arch-from-summary", type=str, default=None, help="Use Top-1 architecture from a standard summary.json for robust HPO.")
+    parser.add_argument("--dataset-gc", type=float, default=None, help="For robust HPO: GC of dataset to optimize (per-dataset study).")
+    parser.add_argument("--dataset-cons", type=float, default=None, help="For robust HPO: Conservation of dataset to optimize (per-dataset study).")
     # Removed smoke-test flag to avoid accidental short runs in production
 
     # Dataset coverage and robustness options
@@ -2742,6 +3056,10 @@ if __name__ == "__main__":
     # HPO / Re-evaluation entry points
     if args.tune:
         run_study(args)
+        sys.exit(0)
+
+    if args.refit_from_summary is not None:
+        refit_from_summary(args)
         sys.exit(0)
 
     if args.reval_trial is not None:

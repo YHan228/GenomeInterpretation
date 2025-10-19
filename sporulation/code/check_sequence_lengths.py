@@ -2,7 +2,7 @@ import os
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor
 
-BASE_DIR = 'sporulation/data'
+BASE_DIR = '/vol/projects/BIFO/genomenet/yichen/phenotype/data'
 SEQ_LEN_THRESHOLD = 1_000_000
 
 def parse_fasta_length(file_path):

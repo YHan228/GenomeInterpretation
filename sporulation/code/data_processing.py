@@ -6,13 +6,13 @@ import numpy as np
 
 # --- Configuration ---
 TAXONOMY_PATH = 'sporulation/sporulation.xlsx'
-BASE_DATA_DIR = 'sporulation/data'
+BASE_DATA_DIR = '/vol/projects/BIFO/genomenet/yichen/phenotype/data'
 FASTA_DIR = os.path.join(BASE_DATA_DIR, 'fasta_combined')
 TRAIN_DIR = os.path.join(BASE_DATA_DIR, 'train')
 VALIDATION_DIR = os.path.join(BASE_DATA_DIR, 'validation')
 TEST_DIR = os.path.join(BASE_DATA_DIR, 'test')
 UNUSED_DIR = os.path.join(BASE_DATA_DIR, 'unused_fasta')
-SUMMARY_CSV_PATH = 'sporulation/data/data_split_summary.csv'
+SUMMARY_CSV_PATH = os.path.join(BASE_DATA_DIR, 'data_split_summary.csv')
 
 STRATIFY_COLUMN = 'Family'
 MIN_SAMPLES_PER_GROUP = 10

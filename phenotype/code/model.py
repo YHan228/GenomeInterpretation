@@ -1,4 +1,5 @@
 import os
+from typing import Optional, Dict, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,11 +57,15 @@ class SporulationModel(nn.Module):
     kernel sizes from the sampled continuous values.
     """
 
-    def __init__(self, summary_path: str = _DEFAULT_SUMMARY_PATH, num_classes: int = 2):
+    def __init__(self, summary_path: str = _DEFAULT_SUMMARY_PATH, num_classes: int = 2, params: Optional[Dict[str, Any]] = None):
         super(SporulationModel, self).__init__()
 
-        # Load HPs and derive architecture
-        hp = load_best_hparams_from_summary(summary_path)
+        # Load HPs and derive architecture. Prefer explicit Optuna params if provided.
+        hp = {}
+        if isinstance(params, dict) and len(params) > 0:
+            hp = dict(params)
+        else:
+            hp = load_best_hparams_from_summary(summary_path)
 
         # Derive integers using the same logic as tuning
         k1_idx = int(hp.get('k1_idx', 100))
@@ -81,11 +86,19 @@ class SporulationModel(nn.Module):
         c3 = int(max(64, min(512, 32 * round(c3_cont / 32.0))))
         use_pool2 = bool(hp.get('use_pool2', True))
         use_pool3 = bool(hp.get('use_pool3', False)) if n_blocks >= 2 else False
-        # Defaults when not sampled (match tuning fallback)
-        pool2_k = 3 if not use_pool2 else 3
-        pool2_s = 2 if not use_pool2 else 2
-        pool3_k = 3 if not (n_blocks >= 3 and use_pool3) else 3
-        pool3_s = 2 if not (n_blocks >= 3 and use_pool3) else 2
+        # Pooling kernel/stride indices follow the exact rules used in SporoCNN during tuning
+        if use_pool2:
+            pool2_k = int(2 * int(hp.get('pool2_k_idx', 3)) + 1)
+            pool2_s = int(hp.get('pool2_s_int', 2))
+        else:
+            pool2_k = 3
+            pool2_s = 2
+        if n_blocks >= 3 and use_pool3:
+            pool3_k = int(2 * int(hp.get('pool3_k_idx', 2)) + 1)
+            pool3_s = int(hp.get('pool3_s_int', 2))
+        else:
+            pool3_k = 3
+            pool3_s = 2
 
         drop1 = float(hp.get('drop1', 0.1))
         drop2 = float(hp.get('drop2', 0.1))

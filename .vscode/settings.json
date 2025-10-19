@@ -5,5 +5,6 @@
     ],
     "terminal.integrated.defaultProfile.linux": "zsh",
     "python.terminal.activateEnvironment": false,
-    "python.terminal.executeInFileDir": true
+    "python.terminal.executeInFileDir": true,
+    "chatgpt.openOnStartup": true
 }
