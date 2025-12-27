@@ -1,84 +1,37 @@
-# RStudio project files
+# =============================================================================
+# GenomeInterpretation .gitignore
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# IDE and Editor Settings
+# -----------------------------------------------------------------------------
+.vscode/
+.idea/
+.cursor/
+.claude/
+.ipynb_checkpoints/
+*.code-workspace
+
+# -----------------------------------------------------------------------------
+# R/RStudio
+# -----------------------------------------------------------------------------
 .Rproj.user/
 *.Rproj
 .Rhistory
 .RData
 .Ruserdata
-
-# Compiled code
-*.o
-*.so
-*.dll
-
-# Cache and logs
 *.rdb
 *.rds
 *.RDataTmp
-*.log
-*.out
-
-# Packages
-*.tar.gz
-*.zip
-
-# Temporary files
-*.tmp
-*.swp
-*.bak
-*.backup
-*.npz
-
-# Hidden system files
-.DS_Store
-Thumbs.db
-
-# Python virtual environments (if included)
-venv/
-__pycache__/
-
-# Data files
-*.csv
-*.tsv
-*.sav
-*.dta
 *.rda
-*.rds
-*.fasta
-*.FASTA
-*.gff
-
-# any folder named tensorboard
-tensorboard/
-
-# temporary paper
-wang22e.pdf
-s13059-023-02956-3.pdf
 Rplots.pdf
 
-# any png file with "filter_[0-9].png"
-filter_*.png
-
-*.err
-*.out
-*.log
-
-slurm_results/vanilla_run_*
-!slurm_results/vanilla_run_v5*
-
-koo*
-
-optuna_results*/
-slurm_output/
-
-sporulation/data/
-
-# Editors and IDE settings
-.vscode/
-.idea/
-.ipynb_checkpoints/
-*.code-workspace
-
-# Python build artifacts
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+venv/
+.venv/
+__pycache__/
 *.py[cod]
 *.pyd
 *.pyo
@@ -87,8 +40,6 @@ sporulation/data/
 build/
 dist/
 .eggs/
-
-# Caches and test artifacts
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
@@ -96,18 +47,52 @@ dist/
 coverage.xml
 htmlcov/
 
-# Environments and local secrets
-.venv/
+# -----------------------------------------------------------------------------
+# Compiled Code
+# -----------------------------------------------------------------------------
+*.o
+*.so
+*.dll
+
+# -----------------------------------------------------------------------------
+# System Files
+# -----------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+# -----------------------------------------------------------------------------
+# Logs and Temporary Files
+# -----------------------------------------------------------------------------
+*.log
+*.out
+*.err
+*.tmp
+*.swp
+*.bak
+*.backup
+
+# -----------------------------------------------------------------------------
+# Archives
+# -----------------------------------------------------------------------------
+*.tar.gz
+*.zip
+
+# -----------------------------------------------------------------------------
+# Environments and Secrets
+# -----------------------------------------------------------------------------
 .env
 .env.*
 
-# Databases and state files
+# -----------------------------------------------------------------------------
+# Databases
+# -----------------------------------------------------------------------------
 *.db
 *.sqlite
 *.sqlite3
-optuna.db
 
-# ML/Model artifacts
+# -----------------------------------------------------------------------------
+# ML/Model Artifacts
+# -----------------------------------------------------------------------------
 *.pth
 *.pt
 *.ckpt
@@ -116,25 +101,18 @@ optuna.db
 *.joblib
 *.pkl
 *.npy
+*.npz
 
-# Results and large output directories
-results/
-sim_out/
-tensorboard/
-slurm_results/
-slurm_output/
-spore_optuna/
-sporulation/analysis_out/
-sporulation/results/
-sporulation/model/
-sporulation/robust_model/
-phenotype/model/
-phenotype/outputs/
-phenotype/data/
-phenotype/plots/
-phenotype/robust_model/
-
-# Bioinformatics large files
+# -----------------------------------------------------------------------------
+# Data Files (bioinformatics)
+# -----------------------------------------------------------------------------
+*.csv
+*.tsv
+*.sav
+*.dta
+*.fasta
+*.FASTA
+*.gff
 *.fa
 *.fna
 *.faa
@@ -153,3 +131,79 @@ phenotype/robust_model/
 *.gff.gz
 *.tsv.gz
 *.csv.gz
+*.R
+*.sh
+
+# -----------------------------------------------------------------------------
+# Papers (temporary)
+# -----------------------------------------------------------------------------
+wang22e.pdf
+s13059-023-02956-3.pdf
+
+# -----------------------------------------------------------------------------
+# Generated Plots
+# -----------------------------------------------------------------------------
+filter_*.png
+
+# -----------------------------------------------------------------------------
+# Large Output/Result Directories
+# -----------------------------------------------------------------------------
+# Root level
+analysis/
+plots/
+outputs/
+results/
+sim_out/
+tensorboard/
+slurm_scripts/
+slurm_results/
+slurm_output/
+spore_optuna/
+optuna_results*/
+dataset_cache/
+outputs/
+plots/
+permutation/
+reports/
+phenotype_output/
+sporulation_output/
+
+# Sporulation outputs
+sporulation/data/
+sporulation/analysis_out/
+sporulation/results/
+sporulation/model/
+sporulation/robust_model/
+sporulation/reports/
+
+# Phenotype outputs
+phenotype/model/
+phenotype/outputs/
+phenotype/data/
+phenotype/plots/
+phenotype/robust_model/
+phenotype/bacillales_model/
+phenotype/graphlan/
+
+# Koo outputs
+koo/results/
+koo/data/
+
+# Analysis outputs
+analysis/
+
+# -----------------------------------------------------------------------------
+# SLURM specific
+# -----------------------------------------------------------------------------
+slurm_results/vanilla_run_*
+!slurm_results/vanilla_run_v5*
+
+# -----------------------------------------------------------------------------
+# Other
+# -----------------------------------------------------------------------------
+analyze_trials_gam.R
+check_model_architecture.py
+toy_slurm.py
+merged_experiment.py
+toy_logo_plots.py
+vanilla_visibility.py

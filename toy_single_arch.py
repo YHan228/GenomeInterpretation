@@ -1269,6 +1269,7 @@ def find_adversarial_baseline_pgd(model, xb: torch.Tensor, yb: torch.Tensor, dev
 
     # We only run PGD if the initial prediction for a positive example is correct.
     if not is_correct or yb.item() == 0:
+        # TODO: SHOULD USE UNIFORM BASELINE (0.25) INSTEAD OF ZEROS FOR CONSISTENCY WITH PHENOTYPE/EVALUATION.PY
         return torch.zeros_like(xb, device=dev), stats
 
     loss_fn = nn.BCEWithLogitsLoss()
@@ -1308,6 +1309,7 @@ def find_adversarial_baseline_pgd(model, xb: torch.Tensor, yb: torch.Tensor, dev
         final_logits, _ = model(adv_xb)
         stats['final_logit'] = final_logits.item()
 
+    # TODO: SHOULD USE UNIFORM BASELINE (0.25) INSTEAD OF ZEROS FOR CONSISTENCY WITH PHENOTYPE/EVALUATION.PY
     return torch.zeros_like(xb, device=dev), stats
 
 

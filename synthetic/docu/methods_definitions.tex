@@ -1,0 +1,302 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{bm}
+\usepackage{booktabs}
+
+% Custom commands
+\newcommand{\x}{\mathbf{x}}
+\newcommand{\X}{\mathbf{X}}
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\model}{f_\theta}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\onehot}{\mathbf{e}}
+\newcommand{\Dir}{\mathrm{Dir}}
+\newcommand{\Normal}{\mathcal{N}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+
+\title{Formal Definitions: Adversarial Training and Saliency Evaluation for DNA Sequence Models}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Notation}
+
+Let $\x \in \{0,1\}^{4 \times L}$ denote a one-hot encoded DNA sequence of length $L$, where each position $\x_{:,i} \in \{0,1\}^4$ represents one of the four nucleotides $\{A, C, G, T\}$. Let $\model: \R^{4 \times L} \to \R$ be a neural network mapping sequences to logits, and $\loss(\model(\x), y)$ the binary cross-entropy loss for label $y \in \{0,1\}$.
+
+For a sequence with a planted motif, let $\mathcal{M} \subset \{1, \ldots, L\}$ denote the set of positions within the ground-truth motif region.
+
+%=============================================================================
+\section{Adversarial Training Methods}
+%=============================================================================
+
+\subsection{Direct HotFlip: Gradient-Based Adversarial Training}
+
+Direct HotFlip generates adversarial perturbations by flipping nucleotides that maximally increase the loss, as determined by input gradients.
+
+\begin{definition}[Flip Saliency]
+For a sequence $\x$ at position $i$ currently encoding nucleotide $b = \arg\max_j \x_{j,i}$, the \emph{flip saliency} for substituting to nucleotide $b' \neq b$ is:
+\begin{equation}
+    S_{b',i}(\x) = \frac{\partial \loss}{\partial \x_{b',i}} - \frac{\partial \loss}{\partial \x_{b,i}}
+\end{equation}
+This measures the first-order effect on loss of flipping position $i$ from $b$ to $b'$.
+\end{definition}
+
+\begin{algorithm}[H]
+\caption{Direct HotFlip Adversarial Example Generation}
+\label{alg:direct-hotflip}
+\begin{algorithmic}[1]
+\REQUIRE Sequence $\x$, label $y$, model $\model$, number of flips $k$
+\ENSURE Adversarial sequence $\tilde{\x}$
+\STATE Compute gradient $\mathbf{G} \gets \nabla_{\x} \loss(\model(\x), y)$
+\STATE Compute all flip saliencies $S_{b',i}$ for valid $(b', i)$ pairs
+\STATE $\mathcal{F} \gets \text{top-}k\{(b', i) : S_{b',i}\}$ \COMMENT{$k$ highest saliency flips}
+\STATE $\tilde{\x} \gets \x$
+\FOR{each $(b^*, i^*) \in \mathcal{F}$}
+    \STATE $\tilde{\x}_{:,i^*} \gets \onehot_{b^*}$
+\ENDFOR
+\RETURN $\tilde{\x}$
+\end{algorithmic}
+\end{algorithm}
+
+The number of flips $k$ is determined by the \emph{flip fraction} $\epsilon \in (0,1)$ as $k = \lfloor \epsilon \cdot L \rfloor$.
+
+\paragraph{Flip Scheduling.} During training, the effective flip fraction can be scheduled to gradually increase adversarial strength:
+\begin{equation}
+    \epsilon_t = \epsilon_{\max} \cdot \frac{t}{T}
+\end{equation}
+where $t$ is the current epoch and $T$ is the total number of epochs.
+
+%-----------------------------------------------------------------------------
+\subsection{Iterative HotFlip (Variant)}
+
+Iterative HotFlip refines the perturbation by recomputing gradients after each flip, potentially finding more effective adversarial examples at higher computational cost.
+
+\begin{algorithm}[H]
+\caption{Iterative HotFlip Adversarial Example Generation}
+\label{alg:hotflip}
+\begin{algorithmic}[1]
+\REQUIRE Sequence $\x$, label $y$, model $\model$, number of flips $k$
+\ENSURE Adversarial sequence $\tilde{\x}$
+\STATE $\tilde{\x} \gets \x$
+\FOR{$t = 1, \ldots, k$}
+    \STATE Compute gradient $\mathbf{G} \gets \nabla_{\tilde{\x}} \loss(\model(\tilde{\x}), y)$
+    \FOR{each position $i$ and each nucleotide $b' \neq \arg\max_j \tilde{\x}_{j,i}$}
+        \STATE $S_{b',i} \gets G_{b',i} - G_{b,i}$ where $b = \arg\max_j \tilde{\x}_{j,i}$
+    \ENDFOR
+    \STATE $(b^*, i^*) \gets \arg\max_{b',i} S_{b',i}$ \COMMENT{Best flip}
+    \STATE $\tilde{\x}_{:,i^*} \gets \onehot_{b^*}$ \COMMENT{Apply flip}
+\ENDFOR
+\RETURN $\tilde{\x}$
+\end{algorithmic}
+\end{algorithm}
+
+Iterative HotFlip requires $k$ forward-backward passes compared to one for Direct HotFlip, but accounts for gradient changes induced by earlier flips.
+
+%-----------------------------------------------------------------------------
+\subsection{Random Smoothing (Dirichlet)}
+
+Random smoothing replaces discrete one-hot inputs with continuous relaxations sampled from position-wise Dirichlet distributions centered on the original nucleotides.
+
+\begin{definition}[Dirichlet Smoothing]
+For a one-hot vector $\x_{:,i} = \onehot_b$ at position $i$, the smoothed input is sampled as:
+\begin{equation}
+    \tilde{\x}_{:,i} \sim \Dir(\bm{\alpha}^{(i)}), \quad \text{where } \alpha^{(i)}_j =
+    \begin{cases}
+        \alpha_+ & \text{if } j = b \\
+        1 & \text{otherwise}
+    \end{cases}
+\end{equation}
+The concentration parameter $\alpha_+$ controls the expected perturbation magnitude.
+\end{definition}
+
+\paragraph{Parameterization by Expected Perturbation.}
+Given a target expected perturbation $\epsilon \in (0,1)$, defined as the expected probability mass on non-original nucleotides:
+\begin{equation}
+    \epsilon = 1 - \E[\tilde{\x}_{b,i}] = 1 - \frac{\alpha_+}{\alpha_+ + 3}
+\end{equation}
+Solving for $\alpha_+$:
+\begin{equation}
+    \alpha_+ = \frac{3(1 - \epsilon)}{\epsilon}
+\end{equation}
+
+Training proceeds by sampling $\tilde{\x}$ for each input $\x$ and optimizing $\loss(\model(\tilde{\x}), y)$.
+
+%-----------------------------------------------------------------------------
+\subsection{Gaussian Smoothing}
+
+Gaussian smoothing adds isotropic Gaussian noise directly to the one-hot encoded inputs without re-normalization.
+
+\begin{definition}[Gaussian Input Smoothing]
+For input $\x \in \R^{4 \times L}$, the smoothed input is:
+\begin{equation}
+    \tilde{\x} = \x + \bm{\eta}, \quad \bm{\eta} \sim \Normal(\mathbf{0}, \sigma^2 \mathbf{I})
+\end{equation}
+where $\sigma^2$ is the noise variance.
+\end{definition}
+
+Unlike Dirichlet smoothing, Gaussian smoothing does not preserve the simplex constraint $\sum_j \tilde{\x}_{j,i} = 1$.
+
+%=============================================================================
+\section{Boundary Integrated Gradients}
+%=============================================================================
+
+Integrated Gradients (IG) attributes model predictions to input features by accumulating gradients along a path from a baseline to the input. We introduce \emph{Boundary IG}, which uses an adversarially-generated baseline and applies gradient correction for DNA sequences.
+
+%-----------------------------------------------------------------------------
+\subsection{PGD Baseline Generation}
+
+For a correctly classified input $(\x, y)$, we seek a nearby point $\x'$ where the model prediction flips. This provides a semantically meaningful baseline representing the ``decision boundary.''
+
+\begin{algorithm}[H]
+\caption{PGD Baseline Search}
+\label{alg:pgd-baseline}
+\begin{algorithmic}[1]
+\REQUIRE Input $\x$, label $y$, model $\model$, iterations $T$, step size $\eta$, perturbation bound $\delta$
+\ENSURE Baseline $\x'$ (or $\x^{(u)}$ if unsuccessful)
+\STATE $\x' \gets \x$
+\FOR{$t = 1, \ldots, T$}
+    \STATE $\mathbf{g} \gets \nabla_{\x'} \loss(\model(\x'), y)$
+    \STATE $\x' \gets \x' + \eta \cdot \text{sign}(\mathbf{g})$ \COMMENT{Maximize loss}
+    \STATE $\x' \gets \text{clip}(\x', \x - \delta, \x + \delta)$ \COMMENT{Project to $\ell_\infty$ ball}
+    \STATE $\x' \gets \text{clip}(\x', 0, 1)$ \COMMENT{Ensure valid range}
+    \IF{$\text{sign}(\model(\x')) \neq \text{sign}(\model(\x))$}
+        \RETURN $\x'$ \COMMENT{Prediction flipped}
+    \ENDIF
+\ENDFOR
+\RETURN $\x^{(u)}$ \COMMENT{Fallback: uniform baseline}
+\end{algorithmic}
+\end{algorithm}
+
+The fallback baseline $\x^{(u)}$ is the uniform distribution over nucleotides:
+\begin{equation}
+    \x^{(u)}_{j,i} = 0.25 \quad \forall j \in \{1,2,3,4\}, \; i \in \{1,\ldots,L\}
+\end{equation}
+This represents a position with no nucleotide information, providing a semantically meaningful reference point for DNA sequences.
+
+%-----------------------------------------------------------------------------
+\subsection{Gradient-Corrected Integrated Gradients}
+
+Standard IG computes attributions by integrating gradients along a straight-line path from baseline $\x'$ to input $\x$:
+\begin{equation}
+    \text{IG}_j(\x) = (\x_j - \x'_j) \int_0^1 \frac{\partial \model(\x' + \alpha(\x - \x'))}{\partial \x_j} \, d\alpha
+\end{equation}
+
+For DNA sequences, we apply a \emph{gradient correction} that removes the mean gradient across nucleotide channels at each position, ensuring attributions reflect relative importance within each position.
+
+\begin{definition}[Gradient-Corrected IG for DNA]
+Let $\mathbf{A} \in \R^{4 \times L}$ be the raw IG attribution tensor. The corrected attributions are:
+\begin{equation}
+    \tilde{A}_{j,i} = A_{j,i} - \frac{1}{4}\sum_{k=1}^{4} A_{k,i}
+\end{equation}
+The position-wise attribution score is then:
+\begin{equation}
+    a_i = \left| \sum_{j=1}^{4} \tilde{A}_{j,i} \cdot \x_{j,i} \right|
+\end{equation}
+This computes the contribution of the actual nucleotide at each position under the corrected gradients.
+\end{definition}
+
+\begin{definition}[Boundary Integrated Gradients]
+Boundary IG combines PGD baseline generation with gradient-corrected IG:
+\begin{enumerate}
+    \item Generate baseline $\x'$ via Algorithm~\ref{alg:pgd-baseline}
+    \item Compute raw IG: $\mathbf{A} = \text{IG}(\x; \x')$
+    \item Apply gradient correction to obtain $\tilde{\mathbf{A}}$
+    \item Compute position-wise scores $\mathbf{a} = (a_1, \ldots, a_L)$
+\end{enumerate}
+\end{definition}
+
+%=============================================================================
+\section{Evaluation Metrics}
+%=============================================================================
+
+Let $\mathbf{a} = (a_1, \ldots, a_L)$ be the position-wise attribution scores and $\mathcal{M} \subset \{1, \ldots, L\}$ the ground-truth motif region.
+
+%-----------------------------------------------------------------------------
+\subsection{Saliency AUC}
+
+Saliency AUC measures how well attribution scores discriminate motif positions from background positions, analogous to the area under the ROC curve.
+
+\begin{definition}[Saliency AUC]
+\begin{equation}
+    \text{SaAUC} = \frac{1}{|\mathcal{M}| \cdot |\bar{\mathcal{M}}|} \sum_{i \in \mathcal{M}} \sum_{j \in \bar{\mathcal{M}}} \mathbf{1}[a_i > a_j]
+\end{equation}
+where $\bar{\mathcal{M}} = \{1, \ldots, L\} \setminus \mathcal{M}$ is the complement (background positions).
+\end{definition}
+
+Saliency AUC equals 1.0 when all motif positions have higher attribution than all background positions, and 0.5 for random attributions.
+
+%-----------------------------------------------------------------------------
+\subsection{Windowed Intersection-over-Union (wIoU)}
+
+wIoU measures localization accuracy by finding the contiguous window of fixed length $k$ (matching the motif length) that maximizes total attribution, then computing its overlap with the ground truth.
+
+\begin{definition}[Windowed IoU]
+Let $k = |\mathcal{M}|$ be the motif length. Define the predicted region as:
+\begin{equation}
+    \hat{\mathcal{M}} = \{i^*, i^*+1, \ldots, i^*+k-1\}, \quad \text{where } i^* = \arg\max_{i} \sum_{j=i}^{i+k-1} a_j
+\end{equation}
+The windowed IoU is:
+\begin{equation}
+    \text{wIoU} = \frac{|\hat{\mathcal{M}} \cap \mathcal{M}|}{|\hat{\mathcal{M}} \cup \mathcal{M}|}
+\end{equation}
+\end{definition}
+
+%-----------------------------------------------------------------------------
+\subsection{Saliency Signal-to-Noise Ratio (SaSNR)}
+
+SaSNR quantifies the concentration of attribution energy within the motif region.
+
+\begin{definition}[Saliency SNR]
+\begin{equation}
+    \text{SaSNR} = \frac{\sum_{i \in \mathcal{M}} a_i^2}{\sum_{i=1}^{L} a_i^2}
+\end{equation}
+\end{definition}
+
+SaSNR equals 1.0 when all attribution is concentrated in the motif and equals $|\mathcal{M}|/L$ for uniform attributions.
+
+%-----------------------------------------------------------------------------
+\subsection{Expected SaSNR Under Null}
+
+For statistical comparison, we compute the expected SaSNR under a random attribution baseline.
+
+\begin{definition}[Expected SaSNR]
+If attributions were uniformly distributed across positions:
+\begin{equation}
+    \E[\text{SaSNR}] = \frac{|\mathcal{M}|}{L}
+\end{equation}
+This serves as a null baseline; effective attribution methods should achieve $\text{SaSNR} \gg \E[\text{SaSNR}]$.
+\end{definition}
+
+%=============================================================================
+\section{Training Objective}
+%=============================================================================
+
+\subsection{Phase 1: Standard Training}
+
+In Phase 1, the model is trained on clean inputs to maximize classification accuracy:
+\begin{equation}
+    \theta^* = \arg\min_\theta \E_{(\x,y) \sim \mathcal{D}} \left[ \loss(\model(\x), y) \right]
+\end{equation}
+
+\subsection{Phase 2: Robust Training}
+
+In Phase 2, the architecture is fixed from Phase 1 and the model is trained on adversarially perturbed inputs. For HotFlip-based methods:
+\begin{equation}
+    \theta^* = \arg\min_\theta \E_{(\x,y) \sim \mathcal{D}} \left[ \loss(\model(\tilde{\x}), y) \right]
+\end{equation}
+where $\tilde{\x}$ is generated by Algorithm~\ref{alg:hotflip} or~\ref{alg:direct-hotflip}.
+
+The optimization objective combines accuracy and interpretability:
+\begin{equation}
+    \text{Objective} = 0.9 \cdot \text{SaAUC} + 0.1 \cdot \text{Accuracy}
+\end{equation}
+
+\end{document}

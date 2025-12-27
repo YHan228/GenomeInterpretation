@@ -33,6 +33,11 @@ from typing import Dict, List, Tuple, Optional, Set, Sequence
 
 from urllib.parse import unquote
 
+# Sporulation-related gene regex (consistent with sporulation/code/analyze_gff.py)
+SPORULATION_REGEX = re.compile(
+    r"(?i)\b(spo|ssp|cot|sigma|sig|ger|sleb|cwlj|dpa|spov|spoii|spo0)"
+)
+
 import pandas as pd
 
 try:
@@ -293,7 +298,13 @@ def process_single_gff(
         for phenotype in phenotype_columns:
             slug = phenotype_to_slug(phenotype)
             gt_set = phenotype_gt.get(phenotype, set())
-            row[f"gt_{slug}"] = any(name in gt_set for name in canon_names)
+            # Use regex-based detection for spore_formation (consistent with sporulation/ analysis)
+            if slug == "spore_formation":
+                row[f"gt_{slug}"] = any(
+                    SPORULATION_REGEX.search(name) for name in canon_names if name
+                )
+            else:
+                row[f"gt_{slug}"] = any(name in gt_set for name in canon_names)
             if has_metadata and phenotype in metadata_df.columns:
                 row[phenotype] = md_row[phenotype]
             else:

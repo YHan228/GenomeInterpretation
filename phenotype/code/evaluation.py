@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover
 
 # --------------------------- Editable defaults ---------------------------
 
-DEFAULT_EVAL_DIR = "phenotype/data/eval"
+DEFAULT_EVAL_DIR = str(DATA_ROOT / "eval" / "spore_formation")
 DEFAULT_TEST_DIR = str(DATA_ROOT / "test")
 DEFAULT_MODEL_PATH = "phenotype/model/best_model.pth"
 DEFAULT_ACC_BS = 16

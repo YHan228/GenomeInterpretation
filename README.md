@@ -1,45 +1,81 @@
 # GenomeInterpretation
 
-This is an ongoing project in collaboration with LMU Munich, BIFO \@
-HZI, and Harvard T.H. Chan School of Public Health. The goal is to
-develop a set of tools or modelling standards that can enhance the interpretability
-of phenotype-genome models. Furthermore, we want to automate the process of biomarker discovery
-from genome sequences.
+A collaborative research project between LMU Munich, BIFO @ HZI, and Harvard T.H. Chan School of Public Health.
 
-## Background
+## Overview
 
-See `reports/`. In the [`deepG`](https://deepg.de/index.html) package,
-we have implemented *Intergrated Gradients (IG)*. However, the results
-do not correspond to biological significant features.
+This project develops tools and modeling standards to enhance the interpretability of phenotype-genome models, with the goal of automating biomarker discovery from genome sequences.
 
-We typically train CNN models on one-hot encoded sequences. While IG is
-known to work well on images, our results clearly showcase the need to
-adjust our approach to the biological context.
+We train CNN models on one-hot encoded DNA sequences and apply gradient-based interpretation methods (e.g., Integrated Gradients). This repository contains experiments to validate and improve these interpretation approaches in biological contexts.
 
-## Project Plan
+## Project Structure
 
-The project consists of three main components:
+```
+GenomeInterpretation/
+├── synthetic/          # Synthetic data experiments
+├── koo/                # Explainability/interpretation research
+├── sporulation/        # Sporulation phenotype analysis
+├── phenotype/          # General phenotype prediction
+├── slurm_scripts/      # SLURM job submission scripts
+└── toy_single_arch.py  # Main synthetic experiment entry point
+```
 
-1.  **Synthetic Data Generation**: we are developing an algorithm that
-    generates sequences based on Hidden Markov Models (HMMs) and real bacterial genomes.
-    The sequences then
-    undergo a mutator to ensure heterogeneity and variability in the data. Finally, a random set of
-    homologous genes are inserted randomly to represent the presence of
-    known biomarkers.
+## Components
 
-2.  **GENTOMA**: a permutation-based explanation strategy that utlizes
-    the advantages of genetic algorithms to generate masked sequences
-    that can efficiently flip the prediction of a model. The randomness
-    of the permutation process is controlled by a follow-up neural
-    network mask predictor.
+### 1. Synthetic Data Experiments
 
-3.  **Robust Training**: inspired by [Wang et al.
-    2021](https://arxiv.org/abs/2103.11257), we are developing a robust
-    model training process for one-hot encoded sequences that can
-    enhance interpretability and thus allow the use of gradient-based
-    interpretations, such as BIG.
+Controlled experiments with synthetic sequences to validate interpretation methods.
 
-The project is expected to have more progress by May 2025.
+| Script | Description |
+|--------|-------------|
+| `toy_single_arch.py` | Main entry point for synthetic experiments |
+| `synthetic/code/gc_baseline_sweep.py` | GC-content baseline sanity check |
 
-If you have any questions or are interested in more details, please
-contact me at `yichen.han AT campus.lmu.de`
+**Documentation:** `synthetic/docu/`
+
+### 2. Explainability Research (koo/)
+
+Task-based pipeline for model interpretation and robustness analysis.
+
+| Script | Description |
+|--------|-------------|
+| `koo/code/task3_step1.py` | Step 1 of interpretation pipeline |
+| `koo/code/task3_step2.py` | Step 2 of interpretation pipeline |
+| `koo/code/task3_step3.py` | Step 3 of interpretation pipeline |
+| `koo/code/task3_step4.py` | Step 4 of interpretation pipeline |
+| `koo/code/gc_baseline_classifier.py` | GC-content baseline classifier |
+
+**Documentation:** `koo/README2.md`
+
+### 3. Sporulation Analysis
+
+Sporulation phenotype prediction and multi-model analysis.
+
+| Script | Description |
+|--------|-------------|
+| `sporulation/code/bugphyzz_visual.py` | BugPhyzz data visualization |
+| `sporulation/code/codon_msa.py` | Codon-level MSA analysis |
+| `sporulation/code/figure_four_panel.py` | Multi-panel figure generation |
+| `sporulation/code/rashomon_*.py` | Rashomon set analysis (multiple variants) |
+| `sporulation/code/run_streme.py` | STREME motif discovery |
+
+**Documentation:** `sporulation/docu/`
+
+### 4. Phenotype Prediction (phenotype/)
+
+General-purpose phenotype prediction framework. All scripts in `phenotype/code/` are actively used.
+
+Key scripts include training, evaluation, GFF processing, and genome feature analysis.
+
+## Environment
+
+```bash
+conda env create -f environment.yml
+conda activate genome
+```
+
+Requires: Python 3.12, PyTorch 2.3, CUDA 12.1
+
+## Contact
+
+yichen.han AT campus.lmu.de

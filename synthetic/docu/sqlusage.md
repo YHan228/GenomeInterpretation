@@ -56,7 +56,7 @@ If you get “Host 'X' is not allowed to connect”: your user may not have a '%
 ## 5) Set Optuna storage URL (passwords with special chars)
 If your DB password has characters like `@`, `:`, `/`, `#`, `?`, `&`, you must URL-encode it. Easiest is this one-liner:
 ```bash
-export OPTUNA_STORAGE="mysql+pymysql://optuna_user:$(python -c 'import os,urllib.parse;print(urllib.parse.quote_plus(os.environ["MARIADB_PASSWORD"]))')@bioinf027-deploy-hpc:3306/optuna"
+export OPTUNA_STORAGE="mysql+pymysql://optuna_user:$(python -c 'import os,urllib.parse;print(urllib.parse.quote_plus(os.environ["MARIADB_PASSWORD"]))')@bioinf022-deploy-hpc:3306/optuna"
 ```
 Examples of manual encoding: `@`→`%40`, `:`→`%3A`, `/`→`%2F`, `#`→`%23`, `?`→`%3F`, `&`→`%26`.
 

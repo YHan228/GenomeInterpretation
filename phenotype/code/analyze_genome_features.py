@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Analyze genome-scale sequence statistics and simple phenotype logits."""
+"""Genome snippet analysis with GC%, k-mer heatmaps, and L1 logistic models."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -15,19 +14,15 @@ matplotlib.use("Agg")  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm  # type: ignore
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import balanced_accuracy_score, roc_curve, auc
-from sklearn.preprocessing import StandardScaler, SplineTransformer
+from sklearn.linear_model import LogisticRegressionCV
+from sklearn.metrics import balanced_accuracy_score
+from sklearn.preprocessing import StandardScaler
 
 from phenotype_utils import DATA_ROOT, build_labels_map_and_classes, phenotype_to_slug
 
-# ---------------------------------------------------------------------------
-# Sequence helpers
-# ---------------------------------------------------------------------------
-
 _BASES = "ACGT"
 _BASE_TO_INT = {b: i for i, b in enumerate(_BASES)}
+_FASTA_SUFFIXES = (".fasta", ".fa", ".fna", ".fasta.gz", ".fa.gz", ".fna.gz")
 
 
 def ensure_dir(path: Path) -> None:
@@ -42,9 +37,7 @@ def load_fasta_sequence(path: Path) -> str:
     seq_parts: List[str] = []
     with open(path, "r") as handle:
         for line in handle:
-            if not line:
-                continue
-            if line.startswith(">"):
+            if not line or line.startswith(">"):
                 continue
             seq_parts.append(line.strip())
     return "".join(seq_parts).upper()
@@ -91,170 +84,116 @@ def kmer_to_string(idx: int, k: int) -> str:
     return "".join(chars)
 
 
-# ---------------------------------------------------------------------------
-# File selection and feature extraction
-# ---------------------------------------------------------------------------
+def gather_dataset_files(directories: Iterable[Path], labels_map: Dict[str, int]) -> Dict[int, List[Path]]:
+    files_by_class: Dict[int, List[Path]] = {}
+    for directory in directories:
+        directory = Path(directory)
+        if not directory.is_dir():
+            continue
+        for entry in sorted(directory.iterdir()):
+            if not entry.is_file():
+                continue
+            lower_name = entry.name.strip().lower()
+            if not lower_name.endswith(_FASTA_SUFFIXES):
+                continue
+            class_idx = labels_map.get(lower_name)
+            if class_idx is None:
+                continue
+            files_by_class.setdefault(class_idx, []).append(entry)
+    return files_by_class
 
 
-def select_files_per_class(
-    dataset_dir: Path,
-    labels_map: Dict[str, int],
-    max_per_class: Optional[int],
-    seed: int,
-) -> Dict[int, List[Path]]:
-    class_files: Dict[int, List[Path]] = {label: [] for label in set(labels_map.values())}
-    for entry in sorted(dataset_dir.iterdir()):
-        if not entry.is_file():
-            continue
-        if not entry.name.lower().endswith((".fasta", ".fa", ".fna")):
-            continue
-        label_idx = labels_map.get(entry.name.strip().lower())
-        if label_idx is None:
-            continue
-        class_files.setdefault(label_idx, []).append(entry)
-    rng = np.random.default_rng(seed)
-    selected: Dict[int, List[Path]] = {}
-    for idx, files in class_files.items():
-        if not files:
-            continue
-        if max_per_class is not None and len(files) > max_per_class:
-            chosen = rng.choice(len(files), size=max_per_class, replace=False)
-            selected[idx] = [files[i] for i in sorted(chosen)]
-        else:
-            selected[idx] = files
-    return selected
-
-
-def aggregate_statistics(
+def sample_snippet_dataset(
     dataset_name: str,
-    file_map: Dict[int, List[Path]],
+    files_by_class: Dict[int, List[Path]],
     classes: Sequence[str],
     k_values: Sequence[int],
+    snippet_length: int,
+    max_snippets: int,
+    seed: int,
     verbose: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[int, np.ndarray]]:
+    k_values = sorted(set(int(k) for k in k_values))
+    freq_template = {k: np.zeros((0, 4 ** k), dtype=np.float32) for k in k_values}
+    if max_snippets <= 0 or not files_by_class:
+        return pd.DataFrame(), freq_template
+
+    available: List[Tuple[int, Path]] = []
+    for class_idx, paths in files_by_class.items():
+        for path in paths:
+            available.append((class_idx, path))
+    if not available:
+        return pd.DataFrame(), freq_template
+
+    rng = np.random.default_rng(seed)
     records: List[Dict] = []
     per_k_freqs: Dict[int, List[np.ndarray]] = {k: [] for k in k_values}
+    seq_cache: Dict[Path, str] = {}
+    target = int(max_snippets)
+    max_attempts = max(target * 20, len(available) * 10, 1000)
+    attempts = 0
+    report_step = max(1, target // 10) if target > 0 else 1
 
-    total_files = sum(len(v) for v in file_map.values())
-    processed = 0
-    report_step = max(1, total_files // 50)
-    next_report = report_step
-
-    for class_idx, files in file_map.items():
-        if verbose:
-            print(
-                f"[genome-stats] Dataset '{dataset_name}': processing class '{classes[class_idx]}' with {len(files)} genomes",
-                flush=True,
-            )
-        for path in files:
+    while len(records) < target and attempts < max_attempts:
+        attempts += 1
+        class_idx, path = available[int(rng.integers(len(available)))]
+        seq = seq_cache.get(path)
+        if seq is None:
             seq = load_fasta_sequence(path)
-            if not seq:
-                continue
-            length, counts, gc, n_frac = compute_base_stats(seq)
-            record = {
-                "filename": path.name,
-                "dataset": dataset_name,
-                "class_idx": int(class_idx),
-                "class_name": classes[class_idx],
-                "length": int(length),
-                "gc_content": float(gc),
-                "n_fraction": float(n_frac),
-            }
-            for k in k_values:
-                counts_k = count_kmers(seq, k)
-                total_k = int(counts_k.sum())
-                record[f"k{k}_total"] = total_k
-                freq = counts_k.astype(np.float32)
-                if total_k > 0:
-                    freq /= float(total_k)
-                per_k_freqs[k].append(freq)
-            records.append(record)
-            processed += 1
-            if verbose and processed >= next_report:
-                print(
-                    f"[genome-stats]   processed {processed}/{total_files} genomes in '{dataset_name}'",
-                    flush=True,
-                )
-                next_report += report_step
-        if verbose:
+            seq_cache[path] = seq
+        if len(seq) < snippet_length:
+            continue
+        max_start = len(seq) - snippet_length
+        if max_start < 0:
+            continue
+        start = int(rng.integers(0, max_start + 1))
+        snippet_seq = seq[start : start + snippet_length]
+        if not snippet_seq:
+            continue
+        length, _, gc, n_frac = compute_base_stats(snippet_seq)
+        record = {
+            "snippet_id": f"{dataset_name}_{len(records):06d}",
+            "dataset": dataset_name,
+            "filename": path.name,
+            "source_path": str(path),
+            "class_idx": int(class_idx),
+            "class_name": classes[class_idx],
+            "snippet_start": int(start),
+            "snippet_length": int(snippet_length),
+            "length": int(length),
+            "gc_content": float(gc),
+            "n_fraction": float(n_frac),
+        }
+        for k in k_values:
+            counts_k = count_kmers(snippet_seq, k)
+            total_k = int(counts_k.sum())
+            record[f"k{k}_total"] = total_k
+            freq = counts_k.astype(np.float32)
+            if total_k > 0:
+                freq /= float(total_k)
+            per_k_freqs[k].append(freq)
+        records.append(record)
+        if verbose and len(records) % report_step == 0:
             print(
-                f"[genome-stats] Dataset '{dataset_name}': completed class '{classes[class_idx]}'",
+                f"[genome-stats]   sampled {len(records)}/{target} snippets for '{dataset_name}'",
                 flush=True,
             )
-    if processed == 0:
-        df = pd.DataFrame(columns=["filename", "dataset", "class_idx", "class_name", "length", "gc_content", "n_fraction"])
-    else:
-        df = pd.DataFrame(records)
+
+    if not records:
+        return pd.DataFrame(), freq_template
+    if len(records) < target:
+        print(
+            f"[genome-stats] Warning: sampled {len(records)} of requested {target} snippets for '{dataset_name}'",
+            flush=True,
+        )
+
+    df = pd.DataFrame(records).reset_index(drop=True)
     freq_arrays = {
         k: (np.vstack(per_k_freqs[k]) if per_k_freqs[k] else np.zeros((0, 4 ** k), dtype=np.float32))
         for k in k_values
     }
     return df, freq_arrays
 
-
-def load_or_compute_dataset(
-    slug: str,
-    dataset_name: str,
-    dataset_dir: Path,
-    labels_map: Dict[str, int],
-    classes: Sequence[str],
-    k_values: Sequence[int],
-    cache_dir: Path,
-    max_per_class: Optional[int],
-    seed: int,
-    force_recompute: bool,
-    verbose: bool,
-) -> Tuple[pd.DataFrame, Dict[int, np.ndarray]]:
-    dataset_cache = cache_dir / slug
-    ensure_dir(dataset_cache)
-    df_path = dataset_cache / f"{dataset_name}_records.parquet"
-    freq_paths = {k: dataset_cache / f"{dataset_name}_k{k}_freqs.npz" for k in k_values}
-
-    need_compute = force_recompute or not df_path.exists() or any(not p.exists() for p in freq_paths.values())
-
-    if need_compute:
-        file_map = select_files_per_class(dataset_dir, labels_map, max_per_class, seed)
-        if not file_map:
-            return pd.DataFrame(), {k: np.zeros((0, 4 ** k), dtype=np.float32) for k in k_values}
-        df, freq_arrays = aggregate_statistics(dataset_name, file_map, classes, k_values, verbose=verbose)
-        df.to_parquet(df_path, index=False)
-        for k, arr in freq_arrays.items():
-            np.savez_compressed(freq_paths[k], freqs=arr)
-    else:
-        df = pd.read_parquet(df_path)
-        freq_arrays = {k: np.load(path)["freqs"] for k, path in freq_paths.items()}
-    return df, freq_arrays
-
-
-def compute_class_kmer_stats(
-    df: pd.DataFrame,
-    freq_arrays: Dict[int, np.ndarray],
-    classes: Sequence[str],
-    k_values: Sequence[int],
-) -> Tuple[Dict[int, Dict[int, np.ndarray]], Dict[int, Dict[int, float]]]:
-    counts: Dict[int, Dict[int, np.ndarray]] = {
-        idx: {k: np.zeros(4 ** k, dtype=np.float64) for k in k_values}
-        for idx in range(len(classes))
-    }
-    totals: Dict[int, Dict[int, float]] = {
-        idx: {k: 0.0 for k in k_values} for idx in range(len(classes))
-    }
-    if df.empty:
-        return counts, totals
-    for i, row in df.iterrows():
-        class_idx = int(row["class_idx"])
-        for k in k_values:
-            total_k = float(row.get(f"k{k}_total", 0.0))
-            if total_k <= 0:
-                continue
-            counts[class_idx][k] += freq_arrays[k][i] * total_k
-            totals[class_idx][k] += total_k
-    return counts, totals
-
-
-# ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
 
 def plot_histogram(
     data_by_class: Dict[str, Sequence[float]],
@@ -286,76 +225,20 @@ def plot_histogram(
     plt.close()
 
 
-def plot_scatter(
-    x_by_class: Dict[str, Sequence[float]],
-    y_by_class: Dict[str, Sequence[float]],
-    xlabel: str,
-    ylabel: str,
-    title: str,
-    out_path: Path,
-    max_points_per_class: int = 500,
-    seed: int = 0,
-) -> None:
-    plt.figure(figsize=(10, 6))
-    rng = np.random.default_rng(seed)
-    for name in x_by_class:
-        xs = np.asarray(x_by_class[name], dtype=float)
-        ys = np.asarray(y_by_class[name], dtype=float)
-        if xs.size == 0:
-            continue
-        if xs.size > max_points_per_class:
-            idx = rng.choice(xs.size, size=max_points_per_class, replace=False)
-            xs = xs[idx]
-            ys = ys[idx]
-        plt.scatter(xs, ys, label=name, alpha=0.6, s=20)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-
-
-def plot_top_kmers(
-    kmers: List[str],
-    log2fc: List[float],
-    freq_class: List[float],
-    freq_rest: List[float],
-    class_name: str,
-    k: int,
-    out_path: Path,
-) -> None:
-    if not kmers:
-        return
-    x = np.arange(len(kmers))
-    colors = ["#d95f02" if v < 0 else "#1b9e77" for v in log2fc]
-    plt.figure(figsize=(max(8, len(kmers) * 0.4), 6))
-    plt.bar(x, log2fc, color=colors, edgecolor="black", linewidth=0.5)
-    plt.axhline(0.0, color="black", linewidth=0.8)
-    plt.xticks(x, kmers, rotation=75, ha="right", fontsize=9)
-    plt.ylabel("log2(freq_class / freq_rest)")
-    plt.title(f"Top enriched {k}-mers for {class_name}")
-    ylim = max(abs(min(log2fc)), abs(max(log2fc))) or 1.0
-    plt.ylim(-ylim * 1.1, ylim * 1.1)
-    for x_pos, logfc, f_c, f_r in zip(x, log2fc, freq_class, freq_rest):
-        if not np.isfinite(logfc):
-            continue
-        va = "bottom" if logfc >= 0 else "top"
-        offset = 0.02 * ylim
-        y = logfc + (offset if logfc >= 0 else -offset)
-        plt.text(
-            x_pos,
-            y,
-            f"{f_c:.2e}\nvs {f_r:.2e}",
-            ha="center",
-            va=va,
-            fontsize=7,
-            rotation=90,
-        )
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=220)
-    plt.close()
+def plot_gc_content(train_df: pd.DataFrame, classes: Sequence[str], out_path: Path) -> None:
+    gc_by_class: Dict[str, List[float]] = {}
+    for class_name in classes:
+        sub = train_df[train_df["class_name"] == class_name]
+        gc_by_class[class_name] = sub["gc_content"].astype(float).tolist()
+    bins = np.linspace(0, 1, 60)
+    plot_histogram(
+        gc_by_class,
+        bins=bins,
+        xlabel="GC content",
+        title="GC content distribution by class",
+        out_path=out_path,
+        density=True,
+    )
 
 
 def plot_kmer_heatmap(
@@ -383,118 +266,62 @@ def plot_kmer_heatmap(
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Summary and logistic modelling
-# ---------------------------------------------------------------------------
-
-def summarize_per_class(values: Sequence[float]) -> Dict[str, float]:
-    arr = np.asarray(values, dtype=float)
-    if arr.size == 0:
-        return {"count": 0}
-    return {
-        "count": int(arr.size),
-        "mean": float(arr.mean()),
-        "std": float(arr.std(ddof=0)),
-        "median": float(np.median(arr)),
-        "p10": float(np.percentile(arr, 10)),
-        "p90": float(np.percentile(arr, 90)),
-    }
-
-
-def build_summary(
-    train_df: pd.DataFrame,
+def compute_class_kmer_stats(
+    df: pd.DataFrame,
+    freq_arrays: Dict[int, np.ndarray],
     classes: Sequence[str],
-    enrichment: Dict[int, Dict[int, Dict[str, np.ndarray]]],
     k_values: Sequence[int],
-    out_dir: Path,
-) -> Dict:
-    summary: Dict = {
-        "total_genomes": int(len(train_df)),
-        "classes": list(classes),
-        "per_class_counts": train_df.groupby("class_name").size().to_dict(),
-        "plots": {},
+) -> Tuple[Dict[int, Dict[int, np.ndarray]], Dict[int, Dict[int, float]]]:
+    counts: Dict[int, Dict[int, np.ndarray]] = {
+        idx: {k: np.zeros(4 ** k, dtype=np.float64) for k in k_values}
+        for idx in range(len(classes))
     }
+    totals: Dict[int, Dict[int, float]] = {
+        idx: {k: 0.0 for k in k_values} for idx in range(len(classes))
+    }
+    if df.empty:
+        return counts, totals
+    for i, row in df.iterrows():
+        class_idx = int(row["class_idx"])
+        for k in k_values:
+            total_k = float(row.get(f"k{k}_total", 0.0))
+            if total_k <= 0 or freq_arrays[k].shape[0] <= i:
+                continue
+            counts[class_idx][k] += freq_arrays[k][i] * total_k
+            totals[class_idx][k] += total_k
+    return counts, totals
 
-    print("[genome-stats]   plotting GC/length distributions", flush=True)
 
-    gc_by_class: Dict[str, List[float]] = {}
-    length_by_class: Dict[str, List[float]] = {}
-    n_by_class: Dict[str, List[float]] = {}
-    for class_name in classes:
-        sub = train_df[train_df["class_name"] == class_name]
-        gc_vals = sub["gc_content"].tolist()
-        len_vals = sub["length"].tolist()
-        n_vals = sub["n_fraction"].tolist()
-        gc_by_class[class_name] = gc_vals
-        length_by_class[class_name] = len_vals
-        n_by_class[class_name] = n_vals
-        summary.setdefault("gc_content_stats", {})[class_name] = summarize_per_class(gc_vals)
-        summary.setdefault("length_stats", {})[class_name] = summarize_per_class(len_vals)
-        summary.setdefault("n_content_stats", {})[class_name] = summarize_per_class(n_vals)
-
-    gc_plot = out_dir / "gc_content_distribution.png"
-    plot_histogram(gc_by_class, bins=np.linspace(0, 1, 60), xlabel="GC content", title="GC content distribution by class", out_path=gc_plot, density=True)
-    summary["plots"]["gc_content_distribution"] = str(gc_plot)
-
-    if train_df.empty:
-        length_bins = np.logspace(4, 6, 10)
-    else:
-        length_min = max(1.0, float(train_df["length"].min()))
-        length_max = max(1.0, float(train_df["length"].max()))
-        log_start = math.log10(length_min)
-        log_stop = math.log10(length_max)
-        if math.isclose(log_start, log_stop):
-            log_stop += 0.5
-        length_bins = np.logspace(log_start, log_stop, 50)
-    length_plot = out_dir / "genome_length_distribution.png"
-    plot_histogram(length_by_class, bins=length_bins, xlabel="Genome length (bp)", title="Genome length distribution by class", out_path=length_plot)
-    summary["plots"]["genome_length_distribution"] = str(length_plot)
-
-    scatter_plot = out_dir / "gc_vs_length_scatter.png"
-    plot_scatter(length_by_class, gc_by_class, xlabel="Genome length (bp)", ylabel="GC content", title="GC vs length by class", out_path=scatter_plot)
-    summary["plots"]["gc_vs_length_scatter"] = str(scatter_plot)
-
+def compute_enrichment_statistics(
+    train_df: pd.DataFrame,
+    train_freqs: Dict[int, np.ndarray],
+    classes: Sequence[str],
+    k_values: Sequence[int],
+) -> Dict[int, Dict[int, Dict[str, np.ndarray]]]:
+    counts, totals = compute_class_kmer_stats(train_df, train_freqs, classes, k_values)
+    enrichment: Dict[int, Dict[int, Dict[str, np.ndarray]]] = {idx: {} for idx in range(len(classes))}
     for k in k_values:
-        print(f"[genome-stats]   processing k={k} enrichment", flush=True)
-        freqs_for_heatmap: Dict[str, np.ndarray] = {}
-        for idx, class_name in enumerate(classes):
-            freq = enrichment.get(idx, {}).get(k, {}).get("freq_class")
-            if freq is None:
-                continue
-            freqs_for_heatmap[class_name] = freq
-        heatmap_path = out_dir / f"k{k}_frequency_heatmap.png"
-        plot_kmer_heatmap(freqs_for_heatmap, k=k, out_path=heatmap_path)
-        summary["plots"][f"k{k}_frequency_heatmap"] = str(heatmap_path)
-
-        enrichment_summary: Dict[str, List[Dict[str, float]]] = {}
-        for idx, class_name in enumerate(classes):
-            data = enrichment.get(idx, {}).get(k)
-            if not data:
-                enrichment_summary[class_name] = []
-                continue
-            log2fc = data["log2fc"]
-            freq_class = data["freq_class"]
-            freq_rest = data["freq_rest"]
-            order = np.argsort(-np.abs(log2fc))[:20]
-            kmers = [kmer_to_string(int(i), k) for i in order]
-            top_log2fc = [float(log2fc[i]) for i in order]
-            top_fc = [float(freq_class[i]) for i in order]
-            top_rest = [float(freq_rest[i]) for i in order]
-            enrichment_summary[class_name] = [
-                {
-                    "kmer": kmers[i],
-                    "log2fc": top_log2fc[i],
-                    "freq_class": top_fc[i],
-                    "freq_rest": top_rest[i],
-                }
-                for i in range(len(order))
-            ]
-            bar_path = out_dir / f"k{k}_top_kmers_{class_name}.png"
-            plot_top_kmers(kmers, top_log2fc, top_fc, top_rest, class_name, k, bar_path)
-            summary["plots"][f"k{k}_top_kmers_{class_name}"] = str(bar_path)
-        summary.setdefault("top_kmers", {})[f"k{k}"] = enrichment_summary
-
-    return summary
+        all_counts = np.zeros(4 ** k, dtype=np.float64)
+        for idx in range(len(classes)):
+            all_counts += counts[idx][k]
+        all_total = sum(totals[idx][k] for idx in range(len(classes)))
+        for idx in range(len(classes)):
+            counts_c = counts[idx][k]
+            total_c = totals[idx][k]
+            counts_rest = all_counts - counts_c
+            total_rest = all_total - total_c
+            freq_c = (counts_c + 1.0) / max(1.0, total_c + counts_c.size)
+            if total_rest <= 0:
+                freq_rest = np.full_like(freq_c, freq_c.mean())
+            else:
+                freq_rest = (counts_rest + 1.0) / max(1.0, total_rest + counts_rest.size)
+            log2fc = np.log2(np.divide(freq_c, freq_rest, out=np.zeros_like(freq_c), where=freq_rest > 0))
+            enrichment[idx][k] = {
+                "freq_class": freq_c,
+                "freq_rest": freq_rest,
+                "log2fc": log2fc,
+            }
+    return enrichment
 
 
 def select_top_kmer_indices(
@@ -512,60 +339,38 @@ def select_top_kmer_indices(
         if log2fc.size == 0:
             continue
         n = min(top_n, log2fc.size)
-        if n <= 0:
-            continue
         top = np.argpartition(-np.abs(log2fc), n - 1)[:n]
         selected.update(int(i) for i in top)
     return sorted(selected)
 
 
-def build_design_matrices(
+def build_feature_matrices(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
     train_freqs: Dict[int, np.ndarray],
     test_freqs: Dict[int, np.ndarray],
     k: int,
     selected_indices: Sequence[int],
-    spline_knots: int = 6,
-) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], SplineTransformer, List[str]]:
-    n_frac_train = train_df["n_fraction"].astype(float)
-    gc_train = train_df["gc_content"].astype(float).to_numpy().reshape(-1, 1)
-
-    spline = SplineTransformer(degree=3, n_knots=spline_knots, include_bias=False)
-    gc_spline_train = spline.fit_transform(gc_train)
-    gc_spline_names = [f"gc_spline_{i}" for i in range(gc_spline_train.shape[1])]
-
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     base_train = pd.DataFrame(
         {
-            "gc_content": gc_train.ravel(),
-            "n_fraction": n_frac_train,
-        },
-        index=train_df.index,
+            "gc_content": train_df["gc_content"].astype(float).to_numpy(),
+            "n_fraction": train_df["n_fraction"].astype(float).to_numpy(),
+        }
     )
-    if gc_spline_train.shape[1] > 0:
-        for i, name in enumerate(gc_spline_names):
-            base_train[name] = gc_spline_train[:, i]
-
     if selected_indices:
         kmer_matrix = train_freqs[k][:, selected_indices]
         for j, idx in enumerate(selected_indices):
             base_train[f"k{k}_{kmer_to_string(idx, k)}"] = kmer_matrix[:, j]
 
-    # Test matrix uses same spline transformer
     if not test_df.empty:
-        gc_test = test_df["gc_content"].astype(float).to_numpy().reshape(-1, 1)
-        gc_spline_test = spline.transform(gc_test)
         base_test = pd.DataFrame(
             {
-                "gc_content": gc_test.ravel(),
-                "n_fraction": test_df["n_fraction"].astype(float),
-            },
-            index=test_df.index,
+                "gc_content": test_df["gc_content"].astype(float).to_numpy(),
+                "n_fraction": test_df["n_fraction"].astype(float).to_numpy(),
+            }
         )
-        if gc_spline_test.shape[1] > 0:
-            for i, name in enumerate(gc_spline_names):
-                base_test[name] = gc_spline_test[:, i]
-        if selected_indices:
+        if selected_indices and test_freqs[k].shape[0] == len(test_df):
             kmer_matrix_test = test_freqs[k][:, selected_indices]
             for j, idx in enumerate(selected_indices):
                 base_test[f"k{k}_{kmer_to_string(idx, k)}"] = kmer_matrix_test[:, j]
@@ -573,104 +378,15 @@ def build_design_matrices(
         base_test = pd.DataFrame(columns=base_train.columns)
 
     feature_names = list(base_train.columns)
-    return base_train, base_test, feature_names, spline, gc_spline_names
+    if not test_df.empty:
+        for name in feature_names:
+            if name not in base_test.columns:
+                base_test[name] = 0.0
+        base_test = base_test[feature_names]
+    return base_train, base_test, feature_names
 
 
-def plot_partial_effect(
-    feature_name: str,
-    feature_values: np.ndarray,
-    scaler: StandardScaler,
-    clf: LogisticRegression,
-    base_point: np.ndarray,
-    feature_index: int,
-    class_idx: int,
-    class_label: str,
-    out_path: Path,
-) -> None:
-    lo = float(np.percentile(feature_values, 5))
-    hi = float(np.percentile(feature_values, 95))
-    if math.isclose(lo, hi):
-        lo, hi = float(feature_values.min()), float(feature_values.max())
-    if math.isclose(lo, hi):
-        lo -= 1e-3
-        hi += 1e-3
-    grid = np.linspace(lo, hi, 100)
-    samples = np.tile(base_point, (grid.size, 1))
-    samples[:, feature_index] = grid
-    samples_scaled = scaler.transform(samples)
-    probs = clf.predict_proba(samples_scaled)[:, class_idx]
-    plt.figure(figsize=(6, 4))
-    plt.plot(grid, probs, color="tab:blue")
-    plt.xlabel(feature_name)
-    plt.ylabel(f"P({class_label} | features)")
-    plt.title(f"Partial effect: {feature_name} → {class_label}")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-
-
-def plot_partial_effect_gc(
-    gc_values: np.ndarray,
-    scaler: StandardScaler,
-    clf: LogisticRegression,
-    base_point: np.ndarray,
-    feature_names: List[str],
-    gc_spline_names: List[str],
-    spline: SplineTransformer,
-    class_idx: int,
-    class_label: str,
-    out_path: Path,
-) -> None:
-    gc_idx = feature_names.index("gc_content")
-    lo = float(np.percentile(gc_values, 5))
-    hi = float(np.percentile(gc_values, 95))
-    if math.isclose(lo, hi):
-        lo = float(gc_values.min())
-        hi = float(gc_values.max())
-    if math.isclose(lo, hi):
-        lo -= 1e-3
-        hi += 1e-3
-    grid = np.linspace(lo, hi, 100)
-    samples = np.tile(base_point, (grid.size, 1))
-    for i, val in enumerate(grid):
-        samples[i, gc_idx] = val
-        spline_vals = spline.transform(np.array([[val]])).ravel()
-        for j, name in enumerate(gc_spline_names):
-            idx = feature_names.index(name)
-            samples[i, idx] = spline_vals[j]
-    probs = clf.predict_proba(scaler.transform(samples))[:, class_idx]
-    plt.figure(figsize=(6, 4))
-    plt.plot(grid, probs, color="tab:blue")
-    plt.xlabel("gc_content")
-    plt.ylabel(f"P({class_label} | features)")
-    plt.title(f"Partial effect: gc_content → {class_label}")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-
-
-def plot_roc_curve(
-    fpr: np.ndarray,
-    tpr: np.ndarray,
-    roc_auc: float,
-    out_path: Path,
-    title: str,
-) -> None:
-    plt.figure(figsize=(6, 5))
-    plt.plot(fpr, tpr, color="tab:blue", lw=2, label=f"ROC AUC = {roc_auc:.3f}")
-    plt.plot([0, 1], [0, 1], color="black", lw=1, linestyle="--")
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title(title)
-    plt.legend(loc="lower right")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-
-
-def run_logistic_models(
+def run_cross_validated_logit(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
     train_freqs: Dict[int, np.ndarray],
@@ -679,23 +395,32 @@ def run_logistic_models(
     enrichment: Dict[int, Dict[int, Dict[str, np.ndarray]]],
     k_values: Sequence[int],
     top_kmer_features: int,
+    cv_folds: int,
+    logit_cs: Sequence[float],
     out_dir: Path,
 ) -> Dict[str, Dict[str, object]]:
     results: Dict[str, Dict[str, object]] = {}
+    if train_df.empty:
+        return results
     unique_classes = sorted(train_df["class_idx"].unique().tolist())
-    n_classes = len(unique_classes)
-    if n_classes <= 1:
+    if len(unique_classes) <= 1:
         print("[genome-stats] Logistic analysis skipped (only one class present)", flush=True)
         return results
     class_mapping = {orig: idx for idx, orig in enumerate(unique_classes)}
     inv_mapping = {idx: orig for orig, idx in class_mapping.items()}
-    model_class_names = [classes[inv_mapping[idx]] for idx in range(n_classes)]
+    model_class_names = [classes[inv_mapping[idx]] for idx in range(len(unique_classes))]
     train_labels = train_df["class_idx"].map(class_mapping).to_numpy()
     test_labels = test_df["class_idx"].map(class_mapping).to_numpy() if not test_df.empty else None
+    candidate_cs = sorted({float(c) for c in logit_cs if c > 0})
+    if not candidate_cs:
+        raise ValueError("At least one positive C value must be provided for logistic regression.")
+    dataset_values = (
+        test_df["dataset"].tolist() if "dataset" in test_df.columns else ["test"] * len(test_df)
+    )
 
     for k in k_values:
         selected_indices = select_top_kmer_indices(enrichment, k, top_kmer_features)
-        feature_train_df, feature_test_df, feature_names, spline, gc_spline_names = build_design_matrices(
+        feature_train_df, feature_test_df, feature_names = build_feature_matrices(
             train_df,
             test_df,
             train_freqs,
@@ -707,170 +432,144 @@ def run_logistic_models(
             continue
 
         scaler = StandardScaler()
-        X_train = feature_train_df.to_numpy(dtype=float)
-        X_train_scaled = scaler.fit_transform(X_train)
-        clf = LogisticRegression(
-            max_iter=2000,
-            solver="lbfgs",
+        X_train = scaler.fit_transform(feature_train_df.to_numpy(dtype=float))
+        clf = LogisticRegressionCV(
+            Cs=candidate_cs,
+            penalty="l1",
+            solver="saga",
+            cv=cv_folds,
+            scoring="balanced_accuracy",
             class_weight="balanced",
-            C=0.5,
+            max_iter=5000,
+            n_jobs=None,
+            multi_class="multinomial",
+            refit=True,
         )
-        clf.fit(X_train_scaled, train_labels)
+        clf.fit(X_train, train_labels)
 
         bal_acc = None
         test_pred_path = None
-        auc_score = None
-        roc_path = None
-        if test_labels is not None and len(test_labels) == feature_test_df.shape[0] and feature_test_df.shape[0] > 0:
-            X_test_scaled = scaler.transform(feature_test_df.to_numpy(dtype=float))
-            probs_all = clf.predict_proba(X_test_scaled)
-            y_pred = probs_all.argmax(axis=1)
+        if test_labels is not None and not feature_test_df.empty and len(test_labels) == feature_test_df.shape[0]:
+            X_test = scaler.transform(feature_test_df.to_numpy(dtype=float))
+            probs = clf.predict_proba(X_test)
+            y_pred = probs.argmax(axis=1)
             bal_acc = float(balanced_accuracy_score(test_labels, y_pred))
-            true_prob = probs_all[np.arange(len(test_labels)), test_labels]
             pred_df = pd.DataFrame(
                 {
+                    "snippet_id": test_df["snippet_id"].tolist(),
+                    "dataset": dataset_values,
                     "filename": test_df["filename"].tolist(),
-                    "class_name": test_df["class_name"].tolist(),
-                    "true_label": test_labels,
-                    "pred_label": y_pred,
-                    "pred_prob_true_class": true_prob,
+                    "true_class_idx": test_df["class_idx"].tolist(),
+                    "true_class_name": test_df["class_name"].tolist(),
+                    "true_label_encoded": test_labels.tolist(),
+                    "pred_label_encoded": y_pred.tolist(),
+                    "pred_class_idx": [unique_classes[idx] for idx in y_pred],
+                    "pred_class_name": [classes[unique_classes[idx]] for idx in y_pred],
                 }
             )
-            test_pred_path = out_dir / f"logit_test_predictions_k{k}.parquet"
-            if n_classes == 2 and len(np.unique(test_labels)) > 1:
-                fpr, tpr, _ = roc_curve(test_labels, probs_all[:, 1])
-                auc_score = float(auc(fpr, tpr))
-                roc_path = out_dir / f"roc_curve_k{k}.png"
-                plot_roc_curve(fpr, tpr, auc_score, roc_path, f"ROC Curve (k={k})")
-            # enrich prediction table with readable labels and probs per class
-            pred_df["true_label_name"] = [model_class_names[idx] for idx in test_labels]
-            pred_df["pred_label_name"] = [model_class_names[idx] for idx in y_pred]
             for class_idx, class_label in enumerate(model_class_names):
-                pred_df[f"pred_prob_{safe_name(class_label)}"] = probs_all[:, class_idx]
+                pred_df[f"pred_prob_{safe_name(class_label)}"] = probs[:, class_idx]
+            test_pred_path = out_dir / f"logit_test_predictions_k{k}.parquet"
             pred_df.to_parquet(test_pred_path, index=False)
 
-        probs_train_all = clf.predict_proba(X_train_scaled)
-        eps = 1e-9
-        ll_model = float(
-            np.sum(np.log(probs_train_all[np.arange(len(train_labels)), train_labels] + eps))
-        )
-        class_counts = np.bincount(train_labels, minlength=n_classes).astype(float)
-        class_probs = class_counts / max(1.0, class_counts.sum())
-        ll_null = float(
-            np.sum(np.log(class_probs[train_labels] + eps))
-        )
-        pseudo_r2 = float(1.0 - (ll_model / ll_null)) if ll_null != 0 else float("nan")
-
-        coef_matrix = clf.coef_
-        intercept_vec = clf.intercept_
-        if n_classes == 2 and coef_matrix.shape[0] == 1:
-            coef_matrix = np.vstack([-coef_matrix[0], coef_matrix[0]])
-            intercept_vec = np.array([-intercept_vec[0], intercept_vec[0]])
-
-        summary_lines = [
-            f"Logistic regression (scikit-learn lbfgs, C={clf.C}, penalty=L2, classes={n_classes})",
-            f"Training samples: {len(train_labels)} | class distribution: {[int(x) for x in class_counts.tolist()]}",
-            f"Pseudo R^2 (McFadden): {pseudo_r2:.4f}",
-            f"Balanced accuracy (test): {bal_acc if bal_acc is not None else 'n/a'}",
-        ]
-        if auc_score is not None:
-            summary_lines.append(f"ROC AUC (test): {auc_score:.4f}")
-        summary_lines.append("Coefficients per class:")
-        for class_idx, class_label in enumerate(model_class_names):
-            summary_lines.append(f"  [{class_label}] intercept: {intercept_vec[class_idx]:.6f}")
-            for name, coef_val in zip(feature_names, coef_matrix[class_idx]):
-                summary_lines.append(f"    {name}: {coef_val:.6f}")
-        summary_text = "\n".join(summary_lines)
-        summary_path = out_dir / f"logit_summary_k{k}.txt"
-        with open(summary_path, "w") as handle:
-            handle.write(summary_text + "\n")
-
-        base_point = feature_train_df.mean().to_numpy(dtype=float)
-        plot_features = ["gc_content", "log_length", "n_fraction"]
-        coef_abs = pd.Series(np.linalg.norm(coef_matrix, axis=0), index=feature_names)
-        sorted_features = [
-            name
-            for name in coef_abs.sort_values(ascending=False).index
-            if name not in plot_features
-        ]
-        plot_features.extend(sorted_features[: min(3, len(sorted_features))])
-
-        partial_plots: Dict[str, Dict[str, str]] = {}
-        for class_idx, class_label in enumerate(model_class_names):
-            class_key = safe_name(class_label) or f"class_{class_idx}"
-            class_plots: Dict[str, str] = {}
-            for name in plot_features:
-                if name not in feature_names:
-                    continue
-                out_path = out_dir / f"partial_effect_k{k}_{name}_{class_key}.png"
-                values = feature_train_df[name].to_numpy(dtype=float)
-                if name == "gc_content":
-                    plot_partial_effect_gc(
-                        values,
-                        scaler,
-                        clf,
-                        base_point.copy(),
-                        feature_names,
-                        gc_spline_names,
-                        spline,
-                        class_idx,
-                        class_label,
-                        out_path,
-                    )
-                else:
-                    idx = feature_names.index(name)
-                    plot_partial_effect(
-                        name,
-                        values,
-                        scaler,
-                        clf,
-                        base_point.copy(),
-                        idx,
-                        class_idx,
-                        class_label,
-                        out_path,
-                    )
-                class_plots[name] = str(out_path)
-            partial_plots[class_label] = class_plots
-
+        best_c = {model_class_names[idx]: float(c_val) for idx, c_val in enumerate(np.ravel(clf.C_))}
         coefficients: Dict[str, Dict[str, float]] = {}
+        coef_matrix = clf.coef_
+        intercepts = clf.intercept_
+        if len(model_class_names) == 2 and coef_matrix.shape[0] == 1:
+            coef_matrix = np.vstack([-coef_matrix[0], coef_matrix[0]])
+            intercepts = np.array([-intercepts[0], intercepts[0]])
         for class_idx, class_label in enumerate(model_class_names):
             coef_map = {name: float(value) for name, value in zip(feature_names, coef_matrix[class_idx])}
-            coef_map["intercept"] = float(intercept_vec[class_idx])
+            coef_map["intercept"] = float(intercepts[class_idx])
             coefficients[class_label] = coef_map
+
+        cv_score_summary: Dict[str, float] = {}
+        if hasattr(clf, "scores_") and clf.scores_:
+            for c_idx, c_val in enumerate(candidate_cs):
+                class_scores = []
+                for cls_scores in clf.scores_.values():
+                    if cls_scores.shape[0] > c_idx:
+                        class_scores.append(float(np.mean(cls_scores[c_idx])))
+                if class_scores:
+                    cv_score_summary[str(c_val)] = float(np.mean(class_scores))
+
+        summary_lines = [
+            f"L1 multinomial logistic regression (k={k})",
+            f"Train snippets: {len(train_labels)}",
+            f"Classes: {', '.join(model_class_names)}",
+            f"Candidate Cs: {', '.join(str(c) for c in candidate_cs)}",
+            f"Best C per class: {', '.join(f'{cls}={c:.4g}' for cls, c in best_c.items())}",
+            f"Test balanced accuracy: {bal_acc if bal_acc is not None else 'n/a'}",
+        ]
+        summary_path = out_dir / f"logit_summary_k{k}.txt"
+        with open(summary_path, "w") as handle:
+            handle.write("\n".join(summary_lines) + "\n")
 
         results[f"k{k}"] = {
             "selected_kmers": [name for name in feature_names if name.startswith(f"k{k}_")],
-            "balanced_accuracy": bal_acc,
-            "roc_auc": auc_score,
-            "pseudo_r2": pseudo_r2,
+            "balanced_accuracy_test": bal_acc,
+            "best_c_per_class": best_c,
+            "cv_scores": cv_score_summary,
             "coefficients": coefficients,
             "class_labels": model_class_names,
             "summary_path": str(summary_path),
-            "partial_effect_plots": partial_plots,
             "test_predictions": str(test_pred_path) if test_pred_path is not None else None,
-            "roc_curve_path": str(roc_path) if roc_path is not None else None,
         }
     return results
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+def build_summary(
+    phenotype: str,
+    slug: str,
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    snippet_length: int,
+    classes: Sequence[str],
+    k_values: Sequence[int],
+    gc_plot_path: Optional[Path],
+    heatmap_paths: Dict[int, Path],
+    logistic_results: Dict[str, Dict[str, object]],
+    train_table_path: Path,
+    test_table_path: Optional[Path],
+    parameters: Dict[str, object],
+) -> Dict[str, object]:
+    summary: Dict[str, object] = {
+        "phenotype": phenotype,
+        "slug": slug,
+        "snippet_length": int(snippet_length),
+        "train_snippets": int(len(train_df)),
+        "test_snippets": int(len(test_df)),
+        "classes": list(classes),
+        "per_class_snippets": train_df.groupby("class_name").size().to_dict(),
+        "k_values": list(map(int, k_values)),
+        "plots": {},
+        "logistic_models": logistic_results,
+        "train_table": str(train_table_path),
+        "parameters": parameters,
+    }
+    if not test_df.empty and test_table_path is not None:
+        summary["test_table"] = str(test_table_path)
+    if gc_plot_path is not None:
+        summary["plots"]["gc_content_distribution"] = str(gc_plot_path)
+    summary["plots"]["kmer_heatmaps"] = {f"k{k}": str(path) for k, path in heatmap_paths.items()}
+    return summary
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Statistical analysis of phenotype training genomes")
-    ap.add_argument("--phenotype", type=str, default="Spore formation", help="Phenotype column to analyze")
-    ap.add_argument("--metadata", type=str, default="sporulation/microbe.cards table S1.xlsx", help="Path to metadata Excel file")
-    ap.add_argument("--data_root", type=str, default=str(DATA_ROOT), help="Root directory containing train/validation/test FASTA")
-    ap.add_argument("--k_values", type=str, default="3,4,6,8", help="Comma-separated list of k-mer sizes to profile")
-    ap.add_argument("--max_genomes_per_class", type=int, default=None, help="Optional cap on number of genomes per class to process")
-    ap.add_argument("--seed", type=int, default=1337, help="Random seed for sampling when applying caps")
-    ap.add_argument("--out_dir", type=str, default=None, help="Optional output directory (defaults to phenotype/plots/genome_stats/<slug>)")
-    ap.add_argument("--cache_dir", type=str, default=None, help="Cache directory under DATA_ROOT (defaults to DATA_ROOT/cache/genome_stats)")
-    ap.add_argument("--force_recompute", action="store_true", help="Force recomputation even if cached features exist")
-    ap.add_argument("--top_kmer_features", type=int, default=40, help="Top enriched k-mers per class (union) to include in logistic models")
+    ap = argparse.ArgumentParser(description="Sample 1 Mbp snippets for phenotype analysis.")
+    ap.add_argument("--phenotype", type=str, default="Spore formation", help="Phenotype column to analyze.")
+    ap.add_argument("--metadata", type=str, default="sporulation/microbe.cards table S1.xlsx", help="Path to metadata Excel file.")
+    ap.add_argument("--data_root", type=str, default=str(DATA_ROOT), help="Root directory containing train/validation/test FASTA.")
+    ap.add_argument("--k_values", type=str, default="3,4,6", help="Comma-separated list of k-mer sizes to profile.")
+    ap.add_argument("--train_snippets", type=int, default=400, help="Number of 1 Mbp snippets to sample from train+validation.")
+    ap.add_argument("--test_snippets", type=int, default=200, help="Number of 1 Mbp snippets to sample from test.")
+    ap.add_argument("--snippet_length", type=int, default=1_000_000, help="Length of each sampled snippet (bp).")
+    ap.add_argument("--seed", type=int, default=1337, help="Random seed for snippet sampling.")
+    ap.add_argument("--top_kmer_features", type=int, default=64, help="Union of enriched k-mers to include as features.")
+    ap.add_argument("--cv_folds", type=int, default=5, help="Number of folds for cross-validated logistic regression.")
+    ap.add_argument("--logit_cs", type=str, default="0.1,0.5,1.0,2.0", help="Comma-separated grid of C values for LogisticRegressionCV.")
+    ap.add_argument("--out_dir", type=str, default=None, help="Output directory (defaults to phenotype/plots/genome_stats/<slug>).")
     return ap.parse_args()
 
 
@@ -878,110 +577,90 @@ def main() -> None:
     args = parse_args()
     phenotype = args.phenotype.strip()
     slug = phenotype_to_slug(phenotype)
-
     data_root = Path(args.data_root).expanduser().resolve()
+
     train_dir = data_root / "train"
+    val_dir = data_root / "validation"
     test_dir = data_root / "test"
 
-    train_dirs = [train_dir]
+    train_dirs = [d for d in (train_dir, val_dir) if d.is_dir()]
+    if not train_dirs:
+        raise FileNotFoundError(f"No training/validation directories found under {data_root}")
 
     try:
         metadata_df = pd.read_excel(args.metadata)
     except Exception as exc:
-        raise RuntimeError(f"Failed to read metadata Excel at {args.metadata}: {exc}")
+        raise RuntimeError(f"Failed to read metadata Excel at {args.metadata}: {exc}") from exc
 
     labels_map, classes = build_labels_map_and_classes(
         metadata_df,
         phenotype_col=phenotype,
         file_col="Fasta file",
-        train_dirs=train_dirs,
+        train_dirs=[str(d) for d in train_dirs],
     )
     if not classes:
         raise RuntimeError(f"No classes inferred for phenotype '{phenotype}'")
 
-    if not train_dir.is_dir():
-        raise FileNotFoundError(f"Training directory not found: {train_dir}")
-    if not test_dir.is_dir():
-        print(f"[genome-stats] Warning: test directory not found ({test_dir}); logistic evaluation will be skipped", flush=True)
-
     k_values = [int(k.strip()) for k in args.k_values.split(",") if k.strip()]
     if not k_values:
-        raise ValueError("At least one k-mer size must be specified")
+        raise ValueError("At least one k-mer size must be specified.")
     print(f"[genome-stats] Profiling k-mer sizes: {k_values}", flush=True)
 
-    cache_dir = Path(args.cache_dir) if args.cache_dir else Path(DATA_ROOT) / "cache" / "genome_stats"
-    ensure_dir(cache_dir)
-
-    train_df, train_freqs = load_or_compute_dataset(
-        slug,
+    train_files = gather_dataset_files(train_dirs, labels_map)
+    train_df, train_freqs = sample_snippet_dataset(
         "train",
-        train_dir,
-        labels_map,
+        train_files,
         classes,
         k_values,
-        cache_dir,
-        args.max_genomes_per_class,
+        args.snippet_length,
+        args.train_snippets,
         args.seed,
-        args.force_recompute,
         verbose=True,
     )
     if train_df.empty:
-        raise RuntimeError("No training genomes were processed; check phenotype labels and data availability")
-    total_selected = len(train_df)
-    print(f"[genome-stats] Selected {total_selected} training genomes across {len(classes)} classes", flush=True)
+        raise RuntimeError("No training snippets were sampled; check phenotype labels and data availability.")
+    print(f"[genome-stats] Sampled {len(train_df)} training snippets.", flush=True)
 
     if test_dir.is_dir():
-        test_df, test_freqs = load_or_compute_dataset(
-            slug,
+        test_files = gather_dataset_files([test_dir], labels_map)
+        test_df, test_freqs = sample_snippet_dataset(
             "test",
-            test_dir,
-            labels_map,
+            test_files,
             classes,
             k_values,
-            cache_dir,
-            args.max_genomes_per_class,
-            args.seed,
-            args.force_recompute,
+            args.snippet_length,
+            args.test_snippets,
+            args.seed + 17,
             verbose=True,
         )
-        print(f"[genome-stats] Loaded test genomes: {len(test_df)}", flush=True)
+        print(f"[genome-stats] Sampled {len(test_df)} test snippets.", flush=True)
     else:
-        test_df, test_freqs = pd.DataFrame(), {k: np.zeros((0, 4 ** k), dtype=np.float32) for k in k_values}
+        print(f"[genome-stats] Warning: test directory not found ({test_dir}); evaluation will be skipped.", flush=True)
+        test_df = pd.DataFrame()
+        test_freqs = {k: np.zeros((0, 4 ** k), dtype=np.float32) for k in k_values}
 
-    counts, totals = compute_class_kmer_stats(train_df, train_freqs, classes, k_values)
-    enrichment: Dict[int, Dict[int, Dict[str, np.ndarray]]] = {idx: {} for idx in range(len(classes))}
-    for k in k_values:
-        all_counts = sum((counts[idx][k] for idx in range(len(classes))), start=np.zeros(4 ** k, dtype=np.float64))
-        all_total = sum(totals[idx][k] for idx in range(len(classes)))
-        for idx in range(len(classes)):
-            counts_c = counts[idx][k]
-            total_c = totals[idx][k]
-            counts_rest = all_counts - counts_c
-            total_rest = all_total - total_c
-            freq_c = (counts_c + 1.0) / max(1.0, total_c + 1.0 * counts_c.size)
-            if total_rest <= 0:
-                freq_rest = np.full_like(freq_c, freq_c.mean())
-            else:
-                freq_rest = (counts_rest + 1.0) / max(1.0, total_rest + 1.0 * counts_rest.size)
-            log2fc = np.log2(np.divide(freq_c, freq_rest, out=np.zeros_like(freq_c), where=freq_rest > 0))
-            enrichment[idx][k] = {
-                "freq_class": freq_c,
-                "freq_rest": freq_rest,
-                "log2fc": log2fc,
-            }
+    enrichment = compute_enrichment_statistics(train_df, train_freqs, classes, k_values)
 
     out_dir = Path(args.out_dir) if args.out_dir else Path("phenotype/plots/genome_stats") / slug
     ensure_dir(out_dir)
 
-    print(f"[genome-stats] Building plots and summary in {out_dir}", flush=True)
-    summary = build_summary(train_df, classes, enrichment, k_values, out_dir)
+    gc_plot_path = out_dir / "gc_content_distribution.png"
+    plot_gc_content(train_df, classes, gc_plot_path)
 
-    stats_path = out_dir / "genome_feature_stats.parquet"
-    train_df.to_parquet(stats_path, index=False)
-    summary["feature_table"] = str(stats_path)
+    heatmap_paths: Dict[int, Path] = {}
+    for k in k_values:
+        freqs_for_heatmap: Dict[str, np.ndarray] = {}
+        for idx, class_name in enumerate(classes):
+            freq = enrichment.get(idx, {}).get(k, {}).get("freq_class")
+            if freq is not None:
+                freqs_for_heatmap[class_name] = freq
+        if freqs_for_heatmap:
+            path = out_dir / f"k{k}_frequency_heatmap.png"
+            plot_kmer_heatmap(freqs_for_heatmap, k, path)
+            heatmap_paths[k] = path
 
-    print("[genome-stats] Fitting logistic baselines", flush=True)
-    logistic_results = run_logistic_models(
+    logit_cs = [float(c.strip()) for c in args.logit_cs.split(",") if c.strip()]
+    logits = run_cross_validated_logit(
         train_df,
         test_df,
         train_freqs,
@@ -990,9 +669,41 @@ def main() -> None:
         enrichment,
         k_values,
         args.top_kmer_features,
+        args.cv_folds,
+        logit_cs,
         out_dir,
     )
-    summary["logistic_models"] = logistic_results
+
+    train_table_path = out_dir / "train_snippets.parquet"
+    train_df.to_parquet(train_table_path, index=False)
+    test_table_path: Optional[Path] = None
+    if not test_df.empty:
+        test_table_path = out_dir / "test_snippets.parquet"
+        test_df.to_parquet(test_table_path, index=False)
+
+    summary = build_summary(
+        phenotype,
+        slug,
+        train_df,
+        test_df,
+        args.snippet_length,
+        classes,
+        k_values,
+        gc_plot_path,
+        heatmap_paths,
+        logits,
+        train_table_path,
+        test_table_path,
+        parameters={
+            "train_dirs": [str(d) for d in train_dirs],
+            "test_dir": str(test_dir) if test_dir.exists() else None,
+            "train_snippets_requested": args.train_snippets,
+            "test_snippets_requested": args.test_snippets,
+            "cv_folds": args.cv_folds,
+            "logit_cs": logit_cs,
+            "top_kmer_features": args.top_kmer_features,
+        },
+    )
 
     summary_path = out_dir / "summary.json"
     with open(summary_path, "w") as handle:

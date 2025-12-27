@@ -1,0 +1,55 @@
+digraph G {
+  rankdir=TB;
+  newrank=true;
+  compound=true;
+  fontname="Helvetica"; node [fontname="Helvetica"]; edge [fontname="Helvetica"];
+  labelloc="t"; label="Koo & Ploenzke (2021)\nTask 3 dataset design\n200 nt per sequence, N=20000";
+
+  // ----- Setup (top, centered) -----
+  subgraph cluster_setup {
+    label="Setup"; style=rounded; color=gray70;
+    s1 [label="Load motif library (JASPAR PFMs)", shape=box];
+    s2 [label="Define core motif pool (n=10)\nSP1, GABPA, CEBPB, MAX, YY1\n(+ reverse complements)", shape=box];
+    s3 [label="Define background motif pool (n=110)\nCore motifs + 50 random JASPAR\n(+ reverse complements)", shape=box];
+    s1 -> s2 -> s3;
+  }
+
+  // A tiny "fork" node centers Setup above both branches
+  fork [shape=point, width=0.01, height=0.01, label=""];
+  s3 -> fork [weight=3];
+
+  // ----- Positive branch -----
+  subgraph cluster_pos {
+    label="Positive class (N=10000)"; style=rounded; color="#8fd19e";
+    p1 [label="Init uniform 200-nt model", shape=box];
+    p2 [label="Sample k ~ weighted dist\n(typically 3-5 motifs)", shape=diamond];
+    p3 [label="Sample k PFMs\nfrom core pool only", shape=box];
+    p4 [label="Embed motifs with\nrandom spacing", shape=box];
+    p5 [label="Sample nucleotides from PWM", shape=box];
+    p6 [label="Label = 1", shape=ellipse];
+    p1 -> p2 -> p3 -> p4 -> p5 -> p6;
+  }
+
+  // ----- Negative branch -----
+  subgraph cluster_neg {
+    label="Negative class (N=10000)"; style=rounded; color="#c7c7c7";
+    n1 [label="Init uniform 200-nt model", shape=box];
+    n2 [label="Sample k ~ weighted dist\n(typically 2-5 motifs)", shape=diamond];
+    n3 [label="Sample k PFMs\nfrom background pool", shape=box];
+    n4 [label="Embed motifs with\nrandom spacing", shape=box];
+    n5 [label="Sample nucleotides from PWM", shape=box];
+    n6 [label="Label = 0", shape=ellipse];
+    n1 -> n2 -> n3 -> n4 -> n5 -> n6;
+  }
+
+  // Place the branches at the same vertical rank and symmetrical
+  { rank = same; p1; n1; }
+  fork -> p1 [weight=3];
+  fork -> n1 [weight=3];
+  p1 -> n1 [style=invis, weight=100];  // keeps them side-by-side
+
+  // ----- Merge / split -----
+  sp [label="Split Train/Val/Test = 70/10/20", shape=box];
+  p6 -> sp;
+  n6 -> sp;
+}

@@ -110,7 +110,7 @@ def _count_labeled_fastas_in_dir(dir_path: str, labels_map: dict) -> int:
     return count
 
 def ensure_data_quality(metadata_df: pd.DataFrame, base_dir: str, phenotype_col: str, file_col: str,
-                        min_train: int = 500, min_val: int = 100, min_test: int = 100) -> None:
+                        min_train: int = 50, min_val: int = 10, min_test: int = 10) -> None:
     train_dir = os.path.join(base_dir, 'train')
     val_dir = os.path.join(base_dir, 'validation')
     test_dir = os.path.join(base_dir, 'test')
@@ -504,20 +504,30 @@ def train_one_trial(
         max_epochs = int(getattr(args, 'max_epochs', 25))
         grad_clip = tuned_grad_clip
 
-        # Scheduled direct hotflip: linearly ramp flips from 1 to max over epochs
+        # Scheduled direct hotflip: ramp flips from 1 to max over epochs
         seq_len_int = int(seq_len)
         max_flips = max(1, int(float(max_flip_fraction) * seq_len_int))
 
-        print(f"[robust] Trial {trial.number} | eps_max={max_flip_fraction:.3g} | schedule=ON | epochs={max_epochs} | train_bs={train_bs} | val_bs={val_bs}", flush=True)
+        schedule_kind = str(getattr(args, 'robust_schedule', 'cosine')).lower()
+        schedule_label = schedule_kind
+        print(f"[robust] Trial {trial.number} | eps_max={max_flip_fraction:.3g} | schedule={schedule_label} | epochs={max_epochs} | train_bs={train_bs} | val_bs={val_bs}", flush=True)
         for epoch in range(max_epochs):
             model.train()
             total_loss = 0.0
             n_batches = 0
             # Compute scheduled flip fraction for this epoch
             if max_epochs > 1:
-                num_flips = 1 + int(np.floor((max_flips - 1) * (epoch / (max_epochs - 1))))
+                t = float(epoch) / float(max_epochs - 1)
             else:
+                t = 1.0
+            if schedule_kind == 'linear':
+                num_flips = 1 + int(np.floor((max_flips - 1) * t))
+            elif schedule_kind == 'none':
                 num_flips = max_flips
+            else:
+                # Cosine ramp: smooth start and end, avoids large final jump
+                scaled = 0.5 * (1.0 - float(np.cos(np.pi * t)))
+                num_flips = 1 + int(np.floor((max_flips - 1) * scaled))
             current_flip_fraction = float(num_flips) / float(seq_len_int)
             for bi, (xb, yb) in enumerate(train_loader):
                 if args.train_steps_per_epoch is not None and bi >= args.train_steps_per_epoch:
@@ -746,16 +756,25 @@ def train_one_trial(
     # Suggest hyperparameters
     # Architectural (quasi-continuous where possible; rounded to valid ints)
     k1 = 2 * trial.suggest_int('k1_idx', 25, 200) + 1
-    c1_cont = trial.suggest_float('c1_cont', 32, 128, log=True)
+    # Keep interpretability boosters: exp activation and large pooling ranges unchanged
+    if getattr(args, 'extended_capacity', False):
+        c1_cont = trial.suggest_float('c1_cont', 64, 256, log=True)
+    else:
+        c1_cont = trial.suggest_float('c1_cont', 32, 128, log=True)
     c1 = int(max(16, min(128, 16 * round(c1_cont / 16.0))))
     stride1 = max(1, int(round(trial.suggest_float('stride1_cont', 5, 50, log=True))))
     pool1_k = max(2, int(round(trial.suggest_float('pool1_k_cont', 10, 128, log=True))))
     pool1_s = max(1, int(round(trial.suggest_float('pool1_s_cont', 5, 50, log=True))))
-    n_blocks = trial.suggest_int('n_blocks', 1, 3)
+    n_blocks_lo = 2 if getattr(args, 'extended_capacity', False) else 1
+    n_blocks = trial.suggest_int('n_blocks', n_blocks_lo, 3)
     k_small = 2 * trial.suggest_int('k_small_idx', 1, 6) + 1
-    c2_cont = trial.suggest_float('c2_cont', 64, 192, log=True)
+    if getattr(args, 'extended_capacity', False):
+        c2_cont = trial.suggest_float('c2_cont', 128, 384, log=True)
+        c3_cont = trial.suggest_float('c3_cont', 256, 768, log=True)
+    else:
+        c2_cont = trial.suggest_float('c2_cont', 64, 192, log=True)
+        c3_cont = trial.suggest_float('c3_cont', 128, 384, log=True)
     c2 = int(max(32, min(256, 32 * round(c2_cont / 32.0))))
-    c3_cont = trial.suggest_float('c3_cont', 128, 384, log=True)
     c3 = int(max(64, min(512, 32 * round(c3_cont / 32.0))))
     use_pool2 = trial.suggest_categorical('use_pool2', [True, False])
     pool2_k = (2 * trial.suggest_int('pool2_k_idx', 1, 5) + 1) if use_pool2 else 3
@@ -763,12 +782,16 @@ def train_one_trial(
     use_pool3 = trial.suggest_categorical('use_pool3', [True, False]) if n_blocks >= 2 else False
     pool3_k = (2 * trial.suggest_int('pool3_k_idx', 1, 4) + 1) if n_blocks >= 3 and use_pool3 else 3
     pool3_s = int(trial.suggest_int('pool3_s_int', 2, 7)) if n_blocks >= 3 and use_pool3 else 2
-    drop1 = trial.suggest_float('drop1', 0.0, 0.4)
+    drop1 = trial.suggest_float('drop1', 0.0, 0.3)
     drop2 = trial.suggest_float('drop2', 0.0, 0.4)
     drop3 = trial.suggest_float('drop3', 0.0, 0.4)
-    drop_fc = trial.suggest_float('drop_fc', 0.2, 0.7)
-    fc_hidden_cont = trial.suggest_float('fc_hidden_cont', 128, 512, log=True)
+    drop_fc = trial.suggest_float('drop_fc', 0.2, 0.6)
+    if getattr(args, 'extended_capacity', False):
+        fc_hidden_cont = trial.suggest_float('fc_hidden_cont', 256, 1024, log=True)
+    else:
+        fc_hidden_cont = trial.suggest_float('fc_hidden_cont', 128, 512, log=True)
     fc_hidden = int(max(64, min(1024, 32 * round(fc_hidden_cont / 32.0))))
+    # Keep activation strictly 'exp' to preserve interpretability baseline
     act1 = trial.suggest_categorical('act1', ['exp'])
     global_pool = trial.suggest_categorical('global_pool', ['avg', 'max'])
 
@@ -965,7 +988,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--phenotype-col', type=str, default=PHENOTYPE_COL, help='Phenotype column name to use as binary label')
     p.add_argument('--file-col', type=str, default=FILE_COL, help='Column containing FASTA filenames (e.g., "Fasta file")')
     p.add_argument('--summary-path', type=str, default=SUMMARY_PATH, help='Optuna summary.txt path for loading tuned HPs')
-    p.add_argument('--outdir-root', type=str, default=os.path.join('phenotype', 'model'), help='Root directory to save tuning outputs by phenotype')
+    p.add_argument('--outdir-root', type=str, default=os.path.join('phenotype', 'bacillales_model'), help='Root directory to save tuning outputs by phenotype')
+    # Capacity controls (keeps interpretability boosters exp/large pooling intact)
+    p.add_argument('--extended-capacity', action='store_true', help='Use wider channel/FC ranges and prefer deeper stacks (2-3 blocks)')
 
     # Robust epsilon-only (sporulation, direct hotflip)
     p.add_argument('--robust-epsilon-only', action='store_true', help='Enable robust tuning for Sporulation with direct hotflip; tune epsilon only')
@@ -981,6 +1006,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--robust-eval-ig-steps', type=int, default=16, help='Fewer IG steps for faster robust eval')
     p.add_argument('--robust-eval-pgd-steps', type=int, default=10, help='Fewer PGD steps for faster robust eval')
     p.add_argument('--robust-eval-sauc-subsample', type=int, default=50000, help='Subsample negatives for SaAUC outside set during robust eval')
+    # Robust flip-fraction schedule
+    p.add_argument('--robust-schedule', type=str, default='cosine', choices=['cosine', 'linear', 'none'], help='Schedule for ramping flip fraction over epochs; use "none" to apply max from epoch 1 (default: cosine)')
 
     args = p.parse_args()
     # Normalize names
@@ -1005,7 +1032,7 @@ def main():
 
     # Data quality gate
     md = read_metadata_table(METADATA_XLSX)
-    ensure_data_quality(md, BASE_DIR, PHENOTYPE_COL, FILE_COL, min_train=500, min_val=100, min_test=100)
+    ensure_data_quality(md, BASE_DIR, PHENOTYPE_COL, FILE_COL, min_train=50, min_val=10, min_test=10)
 
     study = build_study(args)
 

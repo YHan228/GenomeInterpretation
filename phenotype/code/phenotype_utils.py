@@ -465,4 +465,5 @@ def load_ground_truth_gene_sets(
         )
     return result
 # Primary data root (migrated from repo-local `sporulation/data`)
+# DATA_ROOT = Path("/vol/projects/BIFO/genomenet/yichen/phenotype/bacillales")
 DATA_ROOT = Path("/vol/projects/BIFO/genomenet/yichen/phenotype/data")

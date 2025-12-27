@@ -96,7 +96,7 @@ def _count_labeled_fastas_in_dir(dir_path: str, labels_map: dict) -> int:
     return count
 
 def ensure_data_quality(metadata_df: pd.DataFrame, base_dir: str, phenotype_col: str, file_col: str,
-                        min_train: int = 500, min_val: int = 100, min_test: int = 100) -> None:
+                        min_train: int = 50, min_val: int = 10, min_test: int = 10) -> None:
     train_dir = os.path.join(base_dir, 'train')
     val_dir = os.path.join(base_dir, 'validation')
     test_dir = os.path.join(base_dir, 'test')
@@ -343,7 +343,7 @@ def train(args=None):
     phenotype_col = PHENOTYPE_COL_DEFAULT if args is None or getattr(args, 'phenotype_col', None) is None else args.phenotype_col
     file_col = FILE_COL_DEFAULT if args is None or getattr(args, 'file_col', None) is None else args.file_col
     metadata_df = read_metadata_table(metadata_xlsx)
-    ensure_data_quality(metadata_df, BASE_DIR, phenotype_col, file_col, min_train=500, min_val=100, min_test=100)
+    ensure_data_quality(metadata_df, BASE_DIR, phenotype_col, file_col, min_train=50, min_val=10, min_test=10)
 
     # Create datasets and dataloaders
     train_dataset = FastaDataset(os.path.join(BASE_DIR, 'train'), metadata_df, SEQ_LEN, epoch_budget=EPOCH_BUDGET, phenotype_col=phenotype_col, file_col=file_col)

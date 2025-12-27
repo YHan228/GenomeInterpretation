@@ -104,6 +104,19 @@ def nonzero_mask_from_logistic(model: LogisticRegression, p: int) -> np.ndarray:
     return (np.abs(coef) > 0).any(axis=0)
 
 
+def save_fig_formats(fig: plt.Figure, base_path: Path, dpi: int = 150) -> None:
+    """Save figure in PNG, PDF, and SVG formats.
+
+    Args:
+        fig: Matplotlib figure to save
+        base_path: Path without extension (e.g., out_dir / "plot_name")
+        dpi: Resolution for PNG (PDF/SVG are vector formats)
+    """
+    base = Path(base_path)
+    for ext in (".png", ".pdf", ".svg"):
+        fig.savefig(base.with_suffix(ext), dpi=dpi, bbox_inches="tight")
+
+
 def atomic_savez_compressed(path: Path, **arrays: object) -> None:
     """Write NPZ atomically by saving to a temp file then replacing the target.
 
@@ -332,7 +345,7 @@ def plot_cpss(pi_by_gene: Dict[str, float], tau: float, out_dir: Path, topn: int
     ax.set_ylim(0, 1)
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
-    fig.savefig(out_dir / "cpss_selection_probs.png", dpi=150, bbox_inches="tight")
+    save_fig_formats(fig, out_dir / "cpss_selection_probs")
     plt.close(fig)
 
     # Histogram of all pi
@@ -343,7 +356,7 @@ def plot_cpss(pi_by_gene: Dict[str, float], tau: float, out_dir: Path, topn: int
     ax.set_xlim(0, 1)
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
-    fig.savefig(out_dir / "cpss_hist.png", dpi=150, bbox_inches="tight")
+    save_fig_formats(fig, out_dir / "cpss_hist")
     plt.close(fig)
 
     # Size vs tau
@@ -359,7 +372,7 @@ def plot_cpss(pi_by_gene: Dict[str, float], tau: float, out_dir: Path, topn: int
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(out_dir / "cpss_size_vs_tau.png", dpi=150, bbox_inches="tight")
+    save_fig_formats(fig, out_dir / "cpss_size_vs_tau")
     plt.close(fig)
 
 
@@ -424,7 +437,7 @@ def plot_boruta(confirm_rate: np.ndarray, feature_names: Sequence[str], out_dir:
     ax.set_ylim(0, 1)
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
-    fig.savefig(out_dir / "boruta_confirm_rate.png", dpi=150, bbox_inches="tight")
+    save_fig_formats(fig, out_dir / "boruta_confirm_rate")
     plt.close(fig)
 
 
@@ -653,7 +666,7 @@ def plot_vi_cpi_scatter(
             ax.annotate(names[i], (xs[i], ys[i]), fontsize=7, alpha=0.8)
 
     fig.tight_layout()
-    fig.savefig(out_dir / "vi_perm_vs_cpi_scatter.png", dpi=150, bbox_inches="tight")
+    save_fig_formats(fig, out_dir / "vi_perm_vs_cpi_scatter")
     plt.close(fig)
 
 
@@ -669,7 +682,7 @@ def plot_cpi_bar(cpi: np.ndarray, feature_names: Sequence[str], out_dir: Path, t
     ax.set_ylabel("CPI (ΔAUC)")
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
-    fig.savefig(out_dir / "cpi_bar.png", dpi=150, bbox_inches="tight")
+    save_fig_formats(fig, out_dir / "cpi_bar")
     plt.close(fig)
 
 
@@ -1299,9 +1312,9 @@ def main() -> None:
                     pass
                 ax_bs.grid(True, axis="y", alpha=0.3)
                 fig_bs.tight_layout()
-                fig_bs.savefig(out_dir / "lasso_bag_size_hist.png", dpi=150, bbox_inches="tight")
+                save_fig_formats(fig_bs, out_dir / "lasso_bag_size_hist")
                 plt.close(fig_bs)
-                print("[Plot] Saved lasso_bag_size_hist.png", flush=True)
+                print("[Plot] Saved lasso_bag_size_hist.png/pdf/svg", flush=True)
         except Exception:
             print("[Plot] Warning: Failed to save lasso_bag_size_hist.png", flush=True)
 
@@ -1420,9 +1433,9 @@ def main() -> None:
             except Exception:
                 pass
             fig.tight_layout()
-            fig.savefig(out_dir / "val_balanced_accuracy_hist.png", dpi=150, bbox_inches="tight")
+            save_fig_formats(fig, out_dir / "val_balanced_accuracy_hist")
             plt.close(fig)
-            print("[Plot] Saved val_balanced_accuracy_hist.png", flush=True)
+            print("[Plot] Saved val_balanced_accuracy_hist.png/pdf/svg", flush=True)
         else:
             print("[Plot] Warning: No bag-level BA data available to plot.", flush=True)
     except Exception:
@@ -1449,9 +1462,9 @@ def main() -> None:
         ax.grid(True, alpha=0.3)
         ax.annotate(f"Spearman rho={rho:.3f}, p={pval:.2e}", xy=(0.05, 0.95), xycoords='axes fraction', va='top', ha='left')
         fig.tight_layout()
-        fig.savefig(out_dir / "rank_compare_lasso_vs_rf.png", dpi=150, bbox_inches="tight")
+        save_fig_formats(fig, out_dir / "rank_compare_lasso_vs_rf")
         plt.close(fig)
-        print("[Plot] Saved rank_compare_lasso_vs_rf.png", flush=True)
+        print("[Plot] Saved rank_compare_lasso_vs_rf.png/pdf/svg", flush=True)
     except Exception:
         print("[Plot] Warning: Failed to save rank_compare_lasso_vs_rf.png", flush=True)
 
@@ -1472,9 +1485,9 @@ def main() -> None:
             ax.grid(True, alpha=0.3)
             ax.annotate(f"Spearman rho={rho:.3f}, p={pval:.2e}", xy=(0.05, 0.95), xycoords='axes fraction', va='top', ha='left')
             fig.tight_layout()
-            fig.savefig(out_dir / "rank_compare_lasso_vs_rf_perm.png", dpi=150, bbox_inches="tight")
+            save_fig_formats(fig, out_dir / "rank_compare_lasso_vs_rf_perm")
             plt.close(fig)
-            print("[Plot] Saved rank_compare_lasso_vs_rf_perm.png", flush=True)
+            print("[Plot] Saved rank_compare_lasso_vs_rf_perm.png/pdf/svg", flush=True)
         else:
             print("[Plot] Skipped rank_compare_lasso_vs_rf_perm.png (not enough finite PI entries)", flush=True)
     except Exception:
@@ -1496,9 +1509,9 @@ def main() -> None:
             ax.grid(True, alpha=0.3)
             ax.annotate(f"Spearman rho={rho:.3f}, p={pval:.2e}", xy=(0.05, 0.95), xycoords='axes fraction', va='top', ha='left')
             fig.tight_layout()
-            fig.savefig(out_dir / "rank_compare_lasso_vs_cpi.png", dpi=150, bbox_inches="tight")
+            save_fig_formats(fig, out_dir / "rank_compare_lasso_vs_cpi")
             plt.close(fig)
-            print("[Plot] Saved rank_compare_lasso_vs_cpi.png", flush=True)
+            print("[Plot] Saved rank_compare_lasso_vs_cpi.png/pdf/svg", flush=True)
         else:
             print("[Plot] Skipped rank_compare_lasso_vs_cpi.png (not enough finite CPI entries)", flush=True)
     except Exception:
@@ -1745,9 +1758,9 @@ def main() -> None:
         # Heavy textual annotations removed to avoid masking the network
 
         fig.tight_layout()
-        fig.savefig(out_dir / "overlap_network_combined.png", dpi=150, bbox_inches="tight")
+        save_fig_formats(fig, out_dir / "overlap_network_combined")
         plt.close(fig)
-        print("[Plot] Saved overlap_network_combined.png", flush=True)
+        print("[Plot] Saved overlap_network_combined.png/pdf/svg", flush=True)
 
         # Supplementary: UMAP layout to check for embedding artifacts (Guttman effect)
         try:
@@ -1807,10 +1820,10 @@ def main() -> None:
             ax2.set_title("Bag overlap network (UMAP layout; Jaccard distance)")
             # Heavy textual annotations removed to avoid masking the network
             fig2.tight_layout()
-            fig2.savefig(out_dir / "overlap_network_combined_umap.png", dpi=150, bbox_inches="tight")
-            fig2.savefig(out_dir / "panel_A_umap_network.png", dpi=150, bbox_inches="tight")
+            save_fig_formats(fig2, out_dir / "overlap_network_combined_umap")
+            save_fig_formats(fig2, out_dir / "panel_A_umap_network")
             plt.close(fig2)
-            print("[Plot] Saved overlap_network_combined_umap.png", flush=True)
+            print("[Plot] Saved overlap_network_combined_umap.png/pdf/svg", flush=True)
         except Exception as e:
             print(f"[Plot] Skipped UMAP supplementary figure: {e}", flush=True)
         # Panel B: Dice distributions (within LASSO, within RF, cross), computed on original runs
@@ -1940,9 +1953,9 @@ def main() -> None:
             except Exception:
                 pass
             figB.tight_layout()
-            figB.savefig(out_dir / "panel_B_dice_violins.png", dpi=150, bbox_inches="tight")
+            save_fig_formats(figB, out_dir / "panel_B_dice_violins")
             plt.close(figB)
-            print("[Plot] Saved panel_B_dice_violins.png", flush=True)
+            print("[Plot] Saved panel_B_dice_violins.png/pdf/svg", flush=True)
         except Exception:
             print("[Plot] Warning: Failed to build panel_B_dice_violins.png", flush=True)
 
@@ -1990,9 +2003,9 @@ def main() -> None:
                 axC.set_xlabel("Top-50 genes by bag frequency")
             axC.set_ylabel("Bags (deduplicated)")
             figC.tight_layout()
-            figC.savefig(out_dir / "panel_C_bag_barcode_top50.png", dpi=150, bbox_inches="tight")
+            save_fig_formats(figC, out_dir / "panel_C_bag_barcode_top50")
             plt.close(figC)
-            print("[Plot] Saved panel_C_bag_barcode_top50.png", flush=True)
+            print("[Plot] Saved panel_C_bag_barcode_top50.png/pdf/svg", flush=True)
             # Extra: co-occurrence correlation heatmap over training+validation data for the same top-50 genes
             try:
                 if feature_to_cluster is not None and num_clusters is not None:
@@ -2033,9 +2046,9 @@ def main() -> None:
                 aH1.set_title(title_label)
                 fH1.colorbar(imH1, ax=aH1, fraction=0.046, pad=0.04, label='Pearson r')
                 fH1.tight_layout()
-                fH1.savefig(out_dir / 'cooccurrence_corr_top50.png', dpi=150, bbox_inches='tight')
+                save_fig_formats(fH1, out_dir / 'cooccurrence_corr_top50')
                 plt.close(fH1)
-                print('[Plot] Saved cooccurrence_corr_top50.png', flush=True)
+                print('[Plot] Saved cooccurrence_corr_top50.png/pdf/svg', flush=True)
 
                 # Version 2 (clustered): reveal correlation blocks for interpretation
                 try:
@@ -2057,9 +2070,9 @@ def main() -> None:
                 aH2.set_title('Top-50 cluster co-occurrence correlation (train+val; clustered)' if (feature_to_cluster is not None and num_clusters is not None) else 'Top-50 gene co-occurrence correlation (train+val; clustered)')
                 fH2.colorbar(imH2, ax=aH2, fraction=0.046, pad=0.04, label='Pearson r')
                 fH2.tight_layout()
-                fH2.savefig(out_dir / 'cooccurrence_corr_top50_clustered.png', dpi=150, bbox_inches='tight')
+                save_fig_formats(fH2, out_dir / 'cooccurrence_corr_top50_clustered')
                 plt.close(fH2)
-                print('[Plot] Saved cooccurrence_corr_top50_clustered.png', flush=True)
+                print('[Plot] Saved cooccurrence_corr_top50_clustered.png/pdf/svg', flush=True)
             except Exception:
                 print('[Plot] Warning: Failed to save cooccurrence_corr_top50.png', flush=True)
         except Exception:
@@ -2088,9 +2101,9 @@ def main() -> None:
                 axg.axis('off')
                 axg.text(0.02, 0.98, label, transform=axg.transAxes, fontsize=14, fontweight='bold', va='top', ha='left', bbox=dict(boxstyle='round,pad=0.15', fc='white', ec='none', alpha=0.6))
             figG.tight_layout(rect=[0, 0, 1, 1])
-            figG.savefig(out_dir / "multiplicity_panels.png", dpi=150, bbox_inches="tight")
+            save_fig_formats(figG, out_dir / "multiplicity_panels")
             plt.close(figG)
-            print("[Plot] Saved multiplicity_panels.png", flush=True)
+            print("[Plot] Saved multiplicity_panels.png/pdf/svg", flush=True)
         except Exception:
             print("[Plot] Warning: Failed to build multiplicity_panels.png", flush=True)
     except Exception:
@@ -2156,7 +2169,7 @@ def main() -> None:
     stable_genes_df = stable_genes_df.sort_values("pi_hat", ascending=False, kind="mergesort").head(200)
     stable_genes_df.to_csv(out_dir / "stable_genes.csv", index=False)
 
-    print("Saved figures: cpss_selection_probs.png, cpss_hist.png, cpss_size_vs_tau.png, boruta_confirm_rate.png, vi_perm_vs_cpi_scatter.png, cpi_bar.png", flush=True)
+    print("Saved figures (PNG/PDF/SVG): cpss_selection_probs, cpss_hist, cpss_size_vs_tau, boruta_confirm_rate, vi_perm_vs_cpi_scatter, cpi_bar, etc.", flush=True)
     print("Saved tables: h1_summary.json, stable_genes.csv", flush=True)
     print("Wrote outputs to:", str(out_dir), flush=True)
 

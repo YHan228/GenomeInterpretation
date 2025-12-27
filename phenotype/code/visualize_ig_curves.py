@@ -314,10 +314,12 @@ def _plot_sample(
 
     fig.tight_layout()
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"sample_{sample_id}.png")
-    fig.savefig(out_path, dpi=200)
+    base_name = os.path.join(out_dir, f"sample_{sample_id}")
+    # Save in multiple formats
+    for ext in [".png", ".pdf", ".svg"]:
+        fig.savefig(base_name + ext, dpi=200, bbox_inches="tight")
     plt.close(fig)
-    return out_path
+    return base_name + ".png"
 
 
 def _parse_sample_ids(values: Optional[Iterable[str]]) -> List[int]:
@@ -339,7 +341,13 @@ def main() -> None:
     ap.add_argument("--eval_dir", type=str, default=DEFAULT_EVAL_DIR, help="Directory with eval_manifest.json and samples.parquet")
     ap.add_argument("--test_dir", type=str, default=None, help="Override FASTA directory (defaults to manifest entry)")
     ap.add_argument("--standard_model", type=str, default="phenotype/model/spore_formation/best_model.pth", help="Path to standard model checkpoint")
-    ap.add_argument("--robust_model", type=str, default="phenotype/robust_model/spore_cluster_robust_v1_spore_formation/best_model.pth", help="Path to robust model checkpoint")
+    ap.add_argument("--robust_model", type=str, default=None, help="Path to robust model checkpoint (overrides --robust_study if set)")
+    ap.add_argument(
+        "--robust_study",
+        type=str,
+        default="50epochs_linear_spore_formation",
+        help="Study folder under phenotype/robust_model to select robust checkpoint",
+    )
     ap.add_argument("--target_class", type=str, default=None, help="Override target class name")
     ap.add_argument("--num_samples", type=int, default=4, help="Number of target-class samples to visualize (ignored if sample ids provided)")
     ap.add_argument("--sample_id", action="append", help="Specific sample_id(s) to visualize; can be repeated or comma-separated")
@@ -361,7 +369,12 @@ def main() -> None:
         default=100,
         help="Window size (bp) for averaging curves before optional downsampling",
     )
-    ap.add_argument("--out_dir", type=str, default="phenotype/plots/ig_curves", help="Directory to store generated plots")
+    ap.add_argument(
+        "--out_dir",
+        type=str,
+        default="phenotype/plots/ig_curves",
+        help="Parent directory for plots; a study-specific subfolder will be used",
+    )
     ap.add_argument("--device", type=str, default=DEFAULT_DEVICE, help="Device for model inference (cuda/cpu)")
     args = ap.parse_args()
 
@@ -375,7 +388,15 @@ def main() -> None:
     seq_len = int(manifest.get("seq_len", 1_000_000))
 
     std_model = _load_model(args.standard_model, num_classes=max(2, len(classes)), device=device)
-    rob_model = _load_model(args.robust_model, num_classes=max(2, len(classes)), device=device)
+    robust_model_path = (
+        args.robust_model
+        if args.robust_model
+        else os.path.join("phenotype", "robust_model", args.robust_study, "best_model.pth")
+    )
+    rob_model = _load_model(robust_model_path, num_classes=max(2, len(classes)), device=device)
+
+    # Use a study-specific subfolder under the chosen out_dir to avoid overwriting
+    study_out_dir = os.path.join(args.out_dir, args.robust_study)
 
     requested_ids = _parse_sample_ids(args.sample_id)
     rng = np.random.default_rng(int(args.seed))
@@ -442,7 +463,7 @@ def main() -> None:
             std_disp,
             rob_disp,
             mask,
-            args.out_dir,
+            study_out_dir,
             max(1, int(args.max_points)),
             max(1, int(args.smooth_bp)),
             float(args.normalization_percentile),
@@ -481,7 +502,7 @@ def main() -> None:
         )
 
     if out_records:
-        summary_path = os.path.join(args.out_dir, "ig_visualization_summary.json")
+        summary_path = os.path.join(study_out_dir, "ig_visualization_summary.json")
         with open(summary_path, "w") as f:
             json.dump(out_records, f, indent=2)
         print(f"Wrote summary metadata to {summary_path}", flush=True)
