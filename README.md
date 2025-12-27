@@ -1,6 +1,6 @@
 # GenomeInterpretation
 
-A collaborative research project between LMU Munich, BIFO @ HZI, and Harvard T.H. Chan School of Public Health.
+Robustness-Driven Feature Attribution in Genomic Deep Learning with Integrated Gradients
 
 ## Overview
 
